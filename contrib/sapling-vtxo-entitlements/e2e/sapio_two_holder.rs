@@ -68,6 +68,59 @@ fn assert_saved_claim(
     assert!(confirmation.confirmations.unwrap_or(0) > 0);
 }
 
+fn observed_fee_child(ctx: &TestContext, bundle: &ProgramRecoveryBundle) -> serde_json::Value {
+    let record = bundle.recoveries.iter()
+        .find(|r| r.controlled_outpoint == bundle.targets[0]).unwrap();
+    let txid = record.claim.compute_txid();
+    let rpc = ctx.bitcoind().sync_client();
+    let confirmed = ctx.bitcoind().transaction_confirmation(txid).unwrap();
+    let blockhash = confirmed.blockhash.expect("signed recovery claim is unconfirmed");
+    let block = rpc.get_block(&blockhash).expect("get confirmed claim block");
+    let anchor = OutPoint::new(txid, (record.claim.output.len() - 1) as u32);
+    let children = block.txdata.iter().filter(|tx| {
+        tx.input.iter().any(|input| input.previous_output == anchor)
+    }).collect::<Vec<_>>();
+    assert_eq!(children.len(), 1, "claim lacks one definite mined P2A fee child");
+    let child = children[0];
+    assert_eq!(child.input.iter().filter(|i| i.previous_output == anchor).count(), 1);
+    let external = child.input.iter().filter(|i| i.previous_output != anchor)
+        .map(|i| i.previous_output).collect::<Vec<_>>();
+    assert!(!external.is_empty(), "P2A fee child has no independent funding input");
+    let mut input_sat = 0u64;
+    for input in &child.input {
+        assert!(
+            input.previous_output == anchor
+                || (input.previous_output.txid != txid
+                    && record.ancestors.iter()
+                        .all(|ancestor| ancestor.compute_txid() != input.previous_output.txid)),
+            "fee wallet consumed recovered beneficiary principal or Ark ancestry"
+        );
+        let parent = rpc.get_raw_transaction(&input.previous_output.txid, None)
+            .expect("fee child references unavailable Bitcoin transaction");
+        let prior = &parent.output[input.previous_output.vout as usize];
+        if input.previous_output == anchor {
+            assert_eq!(prior.value, Amount::ZERO);
+        } else {
+            assert!(prior.value > Amount::ZERO);
+        }
+        input_sat += prior.value.to_sat();
+    }
+    let output_sat: u64 = child.output.iter().map(|out| out.value.to_sat()).sum();
+    assert!(input_sat > output_sat, "P2A child paid no actual regtest mining fee");
+    json!({
+        "claim_txid": txid.to_string(),
+        "claim_wtxid": record.claim.compute_wtxid().to_string(),
+        "controlled_outpoint": bundle.targets[0].to_string(),
+        "claim_blockhash": blockhash.to_string(),
+        "fee_child_txid": child.compute_txid().to_string(),
+        "fee_child_wtxid": child.compute_wtxid().to_string(),
+        "p2a_anchor": anchor.to_string(),
+        "external_fee_inputs": external.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "external_fee_sats": input_sat - output_sat,
+        "claim_confirmations": confirmed.confirmations.unwrap(),
+    })
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -217,6 +270,10 @@ async fn sapio_real_two_holder_offline_recovery() {
     drop(bob);
     tee.stop().await.unwrap();
     srv.stop().await.unwrap();
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err(),
+        "Sapio local-dev signing API still answers after shutdown");
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
+        "Sapio local-dev signing oracle still answers after shutdown");
 
     // Confirm Alice without Bob's wallet; then confirm Bob independently.
     // Both use the pinned SDK's ordinary, externally funded fee wallet and
@@ -236,6 +293,13 @@ async fn sapio_real_two_holder_offline_recovery() {
         assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
             .confirmations.unwrap_or(0) >= 6);
     }
+
+    let fee_proof = json!({
+        "alice": observed_fee_child(&ctx, &bundle_a),
+        "bob": observed_fee_child(&ctx, &bundle_b),
+        "services_offline_when_fee_children_mined": true,
+    });
+    save_json(&artifact_dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
 
     // Invoke the actual PR #2 standalone auditor on genuinely signed exports.
     // The three executables are explicitly supplied by the external e2e
@@ -279,9 +343,9 @@ async fn sapio_real_two_holder_offline_recovery() {
         std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
         std::ffi::OsStr::new("--wallet"), std::ffi::OsStr::new("alice=alice-recovered"),
         std::ffi::OsStr::new("--wallet"), std::ffi::OsStr::new("bob=bob-recovered"),
-        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(&dest_a),
-        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(&dest_b),
-        std::ffi::OsStr::new("--mine-address"), std::ffi::OsStr::new(&mine_addr),
+        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(dest_a.as_str()),
+        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(dest_b.as_str()),
+        std::ffi::OsStr::new("--mine-address"), std::ffi::OsStr::new(mine_addr.as_str()),
         std::ffi::OsStr::new("--broadcast"),
     ]);
     let receipt: serde_json::Value = serde_json::from_slice(&spend.stdout)
