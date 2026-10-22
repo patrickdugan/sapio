@@ -14,7 +14,8 @@
 //! spent payout may have been spent legitimately by its beneficiary.
 
 use anyhow::{Context, Result, bail, ensure};
-use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
+use std::collections::HashSet;
 use sapling::sapio::recovery::ProgramRecoveryBundle;
 use serde::Serialize;
 use serde_json::Value;
@@ -221,12 +222,22 @@ pub fn verify_confirmed_claim(
         "confirmed transaction differs from the signed recovery claim"
     );
     let mut payouts = Vec::new();
+    let mut holders = HashSet::new();
+    let mut scripts = HashSet::new();
     for recipient in recipients {
+        ensure!(
+            !recipient.holder.trim().is_empty() && holders.insert(&recipient.holder),
+            "duplicate or empty beneficiary identity"
+        );
         let target_script = hex::decode(&recipient.script_pubkey_hex)
             .context("invalid independently specified beneficiary script")?;
+        ensure!(
+            scripts.insert(target_script.clone()),
+            "shared beneficiary payout script"
+        );
         let matches = claim.output.iter().enumerate().filter(|(_, output)| {
             output.value.to_sat() == recipient.sats &&
-            output.script_pubkey.as_bytes() == target_script
+            output.script_pubkey.as_bytes() == target_script.as_slice()
         }).collect::<Vec<_>>();
         ensure!(
             matches.len() == 1,
@@ -409,14 +420,9 @@ mod tests {
             tx: Some(ObservedTransaction { transaction: claim.clone(), confirmations: 20 }),
             unspent: HashSet::new(),
         };
-        // Already rejected by audit_bundle's script/identity uniqueness check.
-        // The helper only examines the exact beneficiary payout, so it
-        // returns separate entries when invoked without the offline guard.
-        assert_eq!(
-            verify_confirmed_claim(&view, &claim, &aliases, OutPoint::null(), 6)
-                .unwrap().payouts.len(),
-            3
-        );
+        assert!(verify_confirmed_claim(
+            &view, &claim, &aliases, OutPoint::null(), 6,
+        ).is_err());
     }
 
     #[test]
