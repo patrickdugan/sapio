@@ -24,11 +24,11 @@ def sample():
         controlled = controlled_txid + ":0"
         payout = claim + ":0"
         offline.append({
-            "outpoint": controlled, "claim_txid": claim,
+            "outpoint": controlled, "claim_txid": claim, "claim_wtxid": claim,
             "protected_sats": sats, "readiness": "Complete",
         })
         chain.append({
-            "controlled_outpoint": controlled, "claim_txid": claim,
+            "controlled_outpoint": controlled, "claim_txid": claim, "claim_wtxid": claim,
             "confirmations": 8,
             "payouts": [{
                 "holder": label, "outpoint": payout,
@@ -37,7 +37,7 @@ def sample():
         })
         holders.append({
             "holder": label, "controlled_outpoint": controlled,
-            "confirmed_claim_txid": claim, "payout_outpoint": payout,
+            "confirmed_claim_txid": claim, "confirmed_claim_wtxid": claim, "payout_outpoint": payout,
             "script_pubkey_hex": script, "sats": sats,
             "confirmations": 8, "unspent_at_tip": True,
         })
@@ -61,12 +61,18 @@ class FakeNode:
         self.payout_script = ALICE
         self.issued_fee = 500
         self.wrong_input = False
+        self.wrong_witness = False
+        self.confirmations = 8
 
     def call(self, method, *args, wallet=None):
         if method == "gettxout":
             return {"value": 0.00060000, "scriptPubKey": {"hex": self.payout_script}}
         if method == "getrawtransaction":
-            return {"txid": A, "confirmations": 8}
+            return {
+                "txid": A,
+                "hash": B if self.wrong_witness else A,
+                "confirmations": self.confirmations,
+            }
         if method == "listunspent":
             return [{
                 "txid": A, "vout": 0, "amount": 0.00060000,
@@ -122,6 +128,16 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_report(report)
 
+    def test_report_witness_substitution_is_rejected(self):
+        report = sample()
+        report["chain"]["targets"][0]["claim_wtxid"] = B
+        with self.assertRaises(ValueError):
+            validate_report(report)
+        report = sample()
+        report["two_holder"]["holders"][1]["confirmed_claim_wtxid"] = "x" * 64
+        with self.assertRaises(ValueError):
+            validate_report(report)
+
     def test_regtest_only_and_no_spent_outputs(self):
         report = sample()
         report["chain"]["network"] = "main"
@@ -139,6 +155,17 @@ class ReportTests(unittest.TestCase):
         node.spendable = False
         with self.assertRaises(ValueError):
             wallet_owns_payout(node, receipt, "watch-only")
+
+    def test_node_witness_substitution_and_lost_confirmation_fails(self):
+        receipt = validate_report(sample())[0]
+        node = FakeNode()
+        node.wrong_witness = True
+        with self.assertRaises(ValueError):
+            wallet_owns_payout(node, receipt, "holder-alice", 6)
+        node.wrong_witness = False
+        node.confirmations = 2
+        with self.assertRaises(ValueError):
+            wallet_owns_payout(node, receipt, "holder-alice", 6)
 
     def test_node_script_substitution_fails(self):
         receipt = validate_report(sample())[0]
