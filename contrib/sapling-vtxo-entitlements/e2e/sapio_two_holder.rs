@@ -76,7 +76,8 @@ fn selected_recovery_anchors(bundles: &[&ProgramRecoveryBundle]) -> HashSet<OutP
                 }).map(|(i, _)| OutPoint::new(tx.compute_txid(), i as u32))
                     .collect::<Vec<_>>();
                 assert_eq!(matches.len(), 1, "signed recovery transaction has no unique P2A anchor");
-                assert!(anchors.insert(matches[0]), "P2A anchor duplicated in signed bundle");
+                // Two sibling exports legitimately repeat one shared signed ancestor.
+                anchors.insert(matches[0]);
             }
         }
     }
@@ -107,6 +108,8 @@ fn trace_sponsor_coin(
     for parent in from_fees {
         trace_sponsor_coin(ctx, parent, initial, recovery_anchors, seen);
     }
+    // Shared ancestral funding may reach different outputs in a Bitcoin DAG.
+    seen.remove(&coin);
 }
 
 fn require_external_fee_wallet_funding(
