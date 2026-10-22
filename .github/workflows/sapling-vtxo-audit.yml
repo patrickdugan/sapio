@@ -1,0 +1,24 @@
+name: SaplingOS recovery-entitlement audit
+
+on:
+  pull_request:
+    paths:
+      - "contrib/sapling-vtxo-entitlements/**"
+      - ".github/workflows/sapling-vtxo-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-auditor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Sapio toolchain
+        run: rustup show
+      - name: Test the independent recovery-entitlement checks
+        run: cargo test --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml
+      - name: Lint the standalone verifier
+        run: cargo clippy --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml --all-targets -- -D warnings
