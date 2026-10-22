@@ -150,6 +150,58 @@ the two-claim shape. A **real signed export** and Bitcoin Core regtest
 service-shutdown capture must be supplied by a SaplingOS integration run
 before a complete two-holder recovery claim can be made.
 
+
+## Separate holder-wallet spending on regtest
+
+Once the exact recovery claims have confirmed and `--two-holder` succeeds,
+save that combined JSON output to a private `two-holder-report.json` file.
+The separate-wallet runner queries Bitcoin Core again, checks that the two
+confirmed recovery outputs still exist and that two **different** Bitcoin
+Core wallets mark their respective UTXOs as `spendable`. It relies solely
+on Bitcoin Core RPC, and never contacts Sapio or Ark.
+
+Its default mode is read-only:
+
+```sh
+python3 contrib/sapling-vtxo-entitlements/scripts/prove_separate_spends.py \
+  /private/two-holder-report.json \
+  --bitcoin-cli /trusted/path/to/bitcoin-cli --datadir /private/bitcoin \
+  --wallet alice=alice-regtest --wallet bob=bob-regtest
+```
+
+For the actual independent-spend witness, provide separate regtest
+destination addresses and explicitly opt into spending both outputs.
+The runner builds one PSBT **per holder**, requires that it spend only that
+holder's recovered UTXO, bounds its fee and pays the specified destination.
+After both transactions are accepted, the supplied mining wallet mines one
+regtest block and the runner checks confirmation:
+
+```sh
+python3 contrib/sapling-vtxo-entitlements/scripts/prove_separate_spends.py \
+  /private/two-holder-report.json \
+  --bitcoin-cli /trusted/path/to/bitcoin-cli --datadir /private/bitcoin \
+  --wallet alice=alice-regtest --wallet bob=bob-regtest \
+  --destination alice=bcrt1... --destination bob=bcrt1... \
+  --mine-wallet miner-regtest --broadcast
+```
+
+Use newly created, distinct Bitcoin Core wallets whose spend keys are
+retained separately. The two claimant wallets must import their own keys
+and recognize the agreed scripts before the signing services are shut down.
+Run this against an **isolated disposable regtest node only**. The
+`--broadcast` step really spends the recovered outputs and therefore
+invalidates a later two-holder **unspent** report. Re-run the script against
+the saved pre-spend report for the signed-spend evidence.
+
+These tests do not manufacture a valid SaplingOS export. Capture the actual
+`wallet.program_recovery_bundle(&[])` result while the program signer is
+available, stop all Ark and Sapio signing actors, then run SaplingOS's
+native `recover_program_bundle` with a separately funded fee wallet and
+publish ancestors one at a time as the SDK directs. The strict audit and
+holder-wallet spend runner come **after** those Bitcoin confirmations.
+Keep a separate service-stop log and fee-wallet funding record. They are
+not attested by either verifier.
+
 ## Verification boundaries
 
 A successful report means the existing SaplingOS cryptographic verifier
