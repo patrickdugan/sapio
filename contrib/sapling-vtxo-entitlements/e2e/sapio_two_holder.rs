@@ -34,6 +34,10 @@ fn new_recipient_wallet(ctx: &TestContext, name: &str) -> (Client, ScriptBuf) {
     (client, address.script_pubkey())
 }
 
+fn script_hex(script: &ScriptBuf) -> String {
+    script.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn save_json(path: &Path, value: &impl serde::Serialize) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
@@ -158,7 +162,7 @@ async fn sapio_real_two_holder_offline_recovery() {
                     "user_pubkey": alice_positions[0].vtxo.user_pubkey().to_string()
                 },
                 "beneficiaries": [
-                    {"holder": "alice", "script_pubkey_hex": hex::encode(alice_script.as_bytes()), "sats": 60000}
+                    {"holder": "alice", "script_pubkey_hex": script_hex(&alice_script), "sats": 60000}
                 ]
             },
             {
@@ -169,7 +173,7 @@ async fn sapio_real_two_holder_offline_recovery() {
                     "user_pubkey": bob_positions[0].vtxo.user_pubkey().to_string()
                 },
                 "beneficiaries": [
-                    {"holder": "bob", "script_pubkey_hex": hex::encode(bob_script.as_bytes()), "sats": 40000}
+                    {"holder": "bob", "script_pubkey_hex": script_hex(&bob_script), "sats": 40000}
                 ]
             }
         ]
