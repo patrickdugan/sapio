@@ -5,12 +5,12 @@
 set -euo pipefail
 
 PIN=b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
-SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 MANIFEST="$REPO/contrib/sapling-vtxo-entitlements/Cargo.toml"
-UPSTREAM="\${SAPLINGOS_CHECKOUT:?Set SAPLINGOS_CHECKOUT to a local Git checkout containing the pinned SaplingOS commit}"
-CAPTURE_DIR="\${SAPLING_TWO_HOLDER_CAPTURE_DIR:-$REPO/test/real-two-holder}"
-BITCOIN_CLI="\${SAPLING_TWO_HOLDER_BITCOIN_CLI:-$(command -v bitcoin-cli || true)}"
+UPSTREAM="${SAPLINGOS_CHECKOUT:?Set SAPLINGOS_CHECKOUT to a local Git checkout containing the pinned SaplingOS commit}"
+CAPTURE_DIR="${SAPLING_TWO_HOLDER_CAPTURE_DIR:-$REPO/test/real-two-holder}"
+BITCOIN_CLI="${SAPLING_TWO_HOLDER_BITCOIN_CLI:-$(command -v bitcoin-cli || true)}"
 
 if [[ "$UPSTREAM" != /* ]] || ! git -C "$UPSTREAM" cat-file -e "$PIN^{commit}" 2>/dev/null; then
     echo "SAPLINGOS_CHECKOUT must be an absolute Git checkout containing $PIN" >&2
@@ -25,7 +25,7 @@ for variable in \
     LIGHTNINGD_EXEC LIGHTNINGD_PLUGIN_DIR \
     SAPIO_TEE_EXEC SAPIO_TEMPLATEHASH_WASM
 do
-    [[ -n "\${!variable:-}" ]] || { echo "Missing required external fixture: $variable" >&2; exit 1; }
+    [[ -n "${!variable:-}" ]] || { echo "Missing required external fixture: $variable" >&2; exit 1; }
 done
 
 mkdir -p "$CAPTURE_DIR"
@@ -35,7 +35,7 @@ if [[ -e "$CAPTURE_DIR/alice-recovery.json" || -e "$CAPTURE_DIR/bob-recovery.jso
     echo "Capture directory already holds signed exports. Choose a fresh SAPLING_TWO_HOLDER_CAPTURE_DIR" >&2
     exit 1
 fi
-TARGET_DIR="\${SAPLING_TWO_HOLDER_TARGET_DIR:-$REPO/contrib/sapling-vtxo-entitlements/target}"
+TARGET_DIR="${SAPLING_TWO_HOLDER_TARGET_DIR:-$REPO/contrib/sapling-vtxo-entitlements/target}"
 cargo build --locked --manifest-path "$MANIFEST" --bins --target-dir "$TARGET_DIR"
 MERGER="$TARGET_DIR/debug/merge-bundles"
 AUDITOR="$TARGET_DIR/debug/sapling-vtxo-entitlements"
