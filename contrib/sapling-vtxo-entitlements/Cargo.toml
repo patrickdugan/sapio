@@ -1,5 +1,6 @@
 [package]
 name = "sapling-vtxo-entitlements"
+default-run = "sapling-vtxo-entitlements"
 version = "0.1.0"
 edition = "2024"
 publish = false
