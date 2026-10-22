@@ -49,10 +49,19 @@ experimental v1 state needs reconciliation using separately saved wallet
 records before migration. Complete v2 snapshots grow with tree occupancy,
 which adds disk writes and storage per pending authorization.
 
-The persisted transaction is **unsigned**. Its body and entitlement state
-survive a crash, while broadcasting still requires a separately preserved
-signed transaction or another valid signing session. A chain observer must
-authenticate confirmation before the coordinator calls `confirm_saved`.
+The transaction is first reserved and fsynced **unsigned**, so its body and
+entitlement state survive a crash before any signer is contacted. Once a
+completed transaction has been assembled, the caller can invoke
+`checkpoint_witnessed(&signed_transaction)` under the same exclusive journal
+lock and only then release it to the network. The journal saves witness bytes
+and their WTXID so the exact candidate can be recovered for independent
+validation and rebroadcast after a process restart.
+
+Witness-byte persistence alone is not a proof that signatures satisfy Bitcoin
+consensus. The signing caller must verify the actual transaction before
+broadcast and independently authenticate confirmation before
+`confirm_saved`. It also needs to recover or rebuild any transaction which
+was authorized but failed before all witnesses were checkpointed.
 
 ## Application-side prevention
 
