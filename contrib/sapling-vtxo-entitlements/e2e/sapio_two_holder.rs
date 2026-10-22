@@ -141,6 +141,24 @@ fn require_external_fee_wallet_funding(
     }
 }
 
+/// The supplied terms and saved signed bundle bytes must survive the outage.
+fn frozen_recovery_evidence(paths: &[&Path]) -> serde_json::Value {
+    let records = paths.iter().map(|path| {
+        let raw = fs::read(path).expect("read frozen signed regtest evidence");
+        json!({
+            "file": path.file_name().expect("named recovery evidence")
+                .to_string_lossy().to_string(),
+            "sha256": sha256::Hash::hash(&raw).to_string(),
+            "bytes": raw.len(),
+        })
+    }).collect::<Vec<_>>();
+    json!({
+        "schema": 1,
+        "fixture": "local-regtest-saplingos-signed-evidence",
+        "files": records,
+    })
+}
+
 fn assert_saved_claim(
     ctx: &TestContext,
     saved: &ProgramRecoveryBundle,
@@ -377,6 +395,11 @@ async fn sapio_real_two_holder_offline_recovery() {
     let bob_file = artifact_dir.join("bob-recovery.json");
     save_json(&alice_file, &bundle_a);
     save_json(&bob_file, &bundle_b);
+    let frozen_paths = [
+        terms_file.as_path(), alice_file.as_path(), bob_file.as_path(),
+    ];
+    let frozen = frozen_recovery_evidence(&frozen_paths);
+    save_json(&artifact_dir.join("frozen-evidence-before-shutdown.json"), &frozen);
 
     // The Ark service and Sapio signing service now disappear. From this
     // point on each claimant reopens solely its persisted seed and unsigned/
@@ -404,6 +427,9 @@ async fn sapio_real_two_holder_offline_recovery() {
         "Bob's recovery published without Bob initiating recovery");
     recover_offline(&ctx, "external-recovery-fees", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
+
+    assert_eq!(frozen_recovery_evidence(&frozen_paths), frozen,
+        "saved SaplingOS signatures or agreed payouts changed after shutdown");
 
     // Reach an independently chosen 6-confirmation policy before redemption.
     ctx.bitcoind().generate(6).await;
@@ -623,6 +649,11 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let bob_file = dir.join("bob-recovery.json");
     save_json(&alice_file, &bundle_a);
     save_json(&bob_file, &bundle_b);
+    let frozen_paths = [
+        terms_file.as_path(), alice_file.as_path(), bob_file.as_path(),
+    ];
+    let frozen = frozen_recovery_evidence(&frozen_paths);
+    save_json(&dir.join("frozen-evidence-before-shutdown.json"), &frozen);
     drop(coordinator_a);
     drop(coordinator_b);
 
@@ -649,6 +680,9 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     recover_offline(&ctx, "bob", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
     ctx.bitcoind().generate(6).await;
+
+    assert_eq!(frozen_recovery_evidence(&frozen_paths), frozen,
+        "saved SaplingOS signatures or agreed payouts changed after shutdown");
 
     let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER")
         .expect("build the pinned merged-bundle verifier"));
