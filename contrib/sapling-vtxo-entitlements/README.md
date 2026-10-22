@@ -263,6 +263,24 @@ SAPLING_TWO_HOLDER_BITCOIN_CLI=/absolute/path/to/bitcoin-cli \
 bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
 ```
 
+To exercise Alice and Bob as **common-root siblings** created by two
+sequential native transfers of one real Ark VTXO, select the second
+opt-in integration scenario:
+
+```sh
+bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
+  sapio_real_common_anchor_two_holder_recovery
+```
+
+The common-root test starts with one 120,000-sat parent and explicitly
+checks that Alice's 60,000-sat VTXO and Bob's 40,000-sat VTXO share
+its actual Bitcoin chain anchor. It then runs both independently
+saved recovery exports through the same cross-target backing auditor
+and requires separate confirmed wallet redemptions after service
+shutdown. Any remaining 20,000 sats in the parent wallet remain outside
+these two selected claims. This scenario is **experimental until the
+pinned real-service suite runs successfully**.
+
 The driver also accepts `SAPLING_TWO_HOLDER_CAPTURE_DIR`; otherwise it
 chooses a new private directory under the user's local state home.
 It fails if that directory already contains signed holder exports.
@@ -281,9 +299,10 @@ redemption, the Python runner rechecks the current chain's witness hash
 and required confirmation depth against the saved signed recovery.
 
 The pinned upstream fixture uses a **local-dev TEE**, meaning no
-hardware-attestation assurance is claimed. This initial two-holder test
-uses **separately boarded VTXOs**; a common-root shared-ancestry fixture
-is a subsequent test. The real integration requires external service
+hardware-attestation assurance is claimed. The default two-holder test uses **separately boarded VTXOs**. The
+optional common-root sibling fixture tests shared signed ancestry. A
+single joint-output claim with two independently executable unilateral
+withdrawals is a further distinct property. The real integration requires external service
 binaries and has not been run by the lightweight dedicated CI.
 
 ## Verification boundaries
