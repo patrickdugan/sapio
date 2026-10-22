@@ -151,6 +151,38 @@ service-shutdown capture must be supplied by a SaplingOS integration run
 before a complete two-holder recovery claim can be made.
 
 
+
+## Combining Alice's and Bob's independent signed exports
+
+Alice and Bob may each have a **separate SaplingOS wallet export**. The
+`merge-bundles` executable checks each signed original independently
+and then validates the union under the existing cross-target ancestry
+and backing checks. It accepts exactly one currently selected VTXO from
+each original and requires a separately attested terms file with one
+different holder on each target.
+
+```sh
+cargo run --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml \
+  --bin merge-bundles -- \
+  /private/alice-recovery.json /private/bob-recovery.json \
+  /private/two-holder-terms.json /private/two-holder-export.json
+```
+
+The output contains the original saved transaction bytes and signers'
+descriptors, with duplicate identical descriptors deduplicated and no
+transaction re-signing. It refuses conflicting duplicates, mismatched
+networks, repeated target positions, incomplete original claims, unexpected
+beneficiary output scripts and economic overlap detectable from the
+signed ancestry. On Unix it writes a new private file with permissions
+`0600`; it never overwrites an earlier saved bundle.
+
+Carry the resulting verified bundle into the pinned SaplingOS **offline
+recovery** implementation with a separately funded fee wallet after
+both services have stopped. Once both claims have confirmed, run the
+standard auditor with `--two-holder` and then the separate wallet
+spend experiment below. The merger itself is an offline input-preparation
+tool and makes no chain-availability claim.
+
 ## Separate holder-wallet spending on regtest
 
 Once the exact recovery claims have confirmed and `--two-holder` succeeds,
