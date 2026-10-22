@@ -791,6 +791,60 @@ mod tests {
     }
 
     #[test]
+    fn witness_checkpoint_survives_serialization_and_rejects_competing_bytes() {
+        let (mut journal, tree, prevout) = setup();
+        let mut after = tree.clone();
+        after.set(0, None).unwrap();
+        let unsigned = transaction(&journal, &after);
+        journal.reserve(&tree, &after, &prevout, &unsigned).unwrap();
+        assert!(journal.witnessed_candidate().is_none());
+        // Synthetic bytes exercise storage integrity, not consensus-valid
+        // Schnorr signatures. The signed integration test uses the oracle.
+        let mut candidate = unsigned.clone();
+        candidate.input[0].witness =
+            bitcoin::Witness::from_slice(&[vec![1u8; 64]]);
+        journal.checkpoint_witnessed(&candidate).unwrap();
+        journal.checkpoint_witnessed(&candidate).unwrap();
+        assert_eq!(journal.witnessed_candidate(), Some(&candidate));
+        let serialized = serde_json::to_vec(&journal).unwrap();
+        let restored: LineageJournal = serde_json::from_slice(&serialized).unwrap();
+        restored.saved_pending().unwrap().unwrap();
+        assert_eq!(restored.witnessed_candidate(), Some(&candidate));
+
+        let mut other = candidate.clone();
+        other.input[0].witness =
+            bitcoin::Witness::from_slice(&[vec![2u8; 64]]);
+        assert!(journal.checkpoint_witnessed(&other).is_err());
+        let mut wrong = candidate;
+        wrong.output[0].value += bitcoin::Amount::ONE_SAT;
+        assert!(journal.checkpoint_witnessed(&wrong).is_err());
+    }
+
+    #[test]
+    fn journal_loader_rejects_damaged_witness_checkpoint() {
+        let (mut journal, tree, prevout) = setup();
+        let mut after = tree.clone();
+        after.set(0, None).unwrap();
+        let unsigned = transaction(&journal, &after);
+        journal.reserve(&tree, &after, &prevout, &unsigned).unwrap();
+        let mut candidate = unsigned;
+        candidate.input[0].witness = bitcoin::Witness::from_slice(&[vec![1u8; 64]]);
+        journal.checkpoint_witnessed(&candidate).unwrap();
+        let mut tampered = serde_json::to_value(journal).unwrap();
+        tampered["pending"]["witnessed"]["transaction"]["input"][0]["witness"] =
+            serde_json::Value::Null;
+        let path = std::env::temp_dir().join(format!(
+            "sapio-damaged-witness-{}-{}.json",
+            std::process::id(),
+            TEMP_NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(LockedLineage::open(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path)).unwrap();
+    }
+
+    #[test]
     fn terminal_pool_cannot_be_reopened_using_the_old_record() {
         let (mut journal, tree, prevout) = setup();
         let empty = Tree::new(2).unwrap();
