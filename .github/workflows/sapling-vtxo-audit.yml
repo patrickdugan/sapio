@@ -26,5 +26,7 @@ jobs:
         run: cargo fmt --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml --all -- --check
       - name: Test the independent recovery-entitlement checks
         run: cargo test --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml
+      - name: Test independent-wallet recovery evidence runner
+        run: python3 -m unittest discover -s contrib/sapling-vtxo-entitlements/scripts -p 'test_*.py'
       - name: Lint the standalone verifier
         run: cargo clippy --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml --all-targets -- -D warnings
