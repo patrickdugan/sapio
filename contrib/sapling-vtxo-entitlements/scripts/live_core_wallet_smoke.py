@@ -145,7 +145,8 @@ def make_simulated_report(items):
 
 
 def run(args, datadir, output):
-    datadir.mkdir(mode=0o700, parents=True)
+    datadir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    datadir.chmod(0o700)
     conf = ("regtest=1\nserver=1\ntxindex=1\nfallbackfee=0.00002\n"
             "[regtest]\nlisten=0\n"
             f"rpcport={port()}\n")
