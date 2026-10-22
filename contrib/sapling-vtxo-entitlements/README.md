@@ -33,6 +33,11 @@ The independent `agreed-payouts.json` follows this schema:
   "targets": [
     {
       "outpoint": "<exact-controlled-vtxo-txid>:<vout>",
+      "program": {
+        "program_id": "<Sapio-Program-v1-id-hex>",
+        "signer_root": "<independently-attested-Sapio-xpub>",
+        "user_pubkey": "<agreed-compressed-public-key-hex>"
+      },
       "beneficiaries": [
         {
           "holder": "alice",
@@ -51,7 +56,11 @@ The independent `agreed-payouts.json` follows this schema:
 ```
 
 Replace each placeholder with an actual agreed transaction outpoint and full
-Bitcoin scriptPubKey (hex). The tool finds the matching signed recovery
+Bitcoin scriptPubKey (hex). Pin the Sapio program ID, full signer xpub from
+independent TEE attestation, and the participant wallet's public key from
+the prior agreement. These fields prevent a self-selected signing service
+or evaluator from satisfying an otherwise internally valid export.
+The tool finds the matching signed recovery
 record, verifies the bundle and requires `Complete` readiness. The combined
 beneficiary amounts must equal the full backed input value. It permits
 exactly one **zero-valued P2A fee anchor** (`51024e73`, BIP 433) and rejects

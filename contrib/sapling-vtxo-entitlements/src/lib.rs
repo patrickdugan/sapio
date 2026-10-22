@@ -38,8 +38,23 @@ pub struct Terms {
 pub struct TargetTerms {
     /// Controlled UTXO that the saved SaplingOS claim spends.
     pub outpoint: String,
+    /// Independently pinned exact program identity and signer root.
+    pub program: ExpectedProgram,
     /// Recipient rights as explicit output scripts and satoshi amounts.
     pub beneficiaries: Vec<Beneficiary>,
+}
+
+/// Contract identity pinned independently of the exported bundle.
+/// The trusted root must come from a separately verified TEE attestation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedProgram {
+    /// Sapio program ID commits to evaluator, program bytes and parameters.
+    pub program_id: String,
+    /// Independently verified Sapio signer xpub.
+    pub signer_root: String,
+    /// Actual wallet user public key of the program instance.
+    pub user_pubkey: String,
 }
 
 /// One expected beneficiary, identified by the external contract's party ID.
@@ -117,7 +132,7 @@ pub fn verify_payouts(
         let script = hex::decode(&term.script_pubkey_hex)
             .with_context(|| format!("invalid script hex for {}", term.holder))?;
         ensure!(!script.is_empty() && script.len() <= 10_000, "invalid beneficiary script length");
-        ensure!(script != ANCHOR_SPK, "fee anchor cannot be a beneficiary");
+        ensure!(script != ANCHOR_SPK.to_vec(), "fee anchor cannot be a beneficiary");
         ensure!(script[0] != 0x6a, "OP_RETURN is not a beneficiary");
         ensure!(scripts.insert(script.clone()), "two participants share one output script");
         planned_sum = planned_sum.checked_add(term.sats).context("participant total overflows")?;
@@ -164,6 +179,24 @@ pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<Aud
         let record = bundle.recoveries.iter()
             .find(|record| record.controlled_outpoint == point)
             .context("bundle missing selected recovery record")?;
+        // Cryptographically valid signatures from a self-selected program
+        // remain meaningless until its exact evaluator/parameters and
+        // signer root are independently pinned by the beneficiaries.
+        let descriptor = bundle.keys.iter()
+            .find(|key| key.program.public_key().ok() == Some(record.program_key))
+            .context("missing signed program identity for recovery")?;
+        ensure!(
+            descriptor.program.program.id().to_string().eq_ignore_ascii_case(&expected.program.program_id),
+            "recovery program ID differs from the independently trusted identity"
+        );
+        ensure!(
+            descriptor.program.root.to_string() == expected.program.signer_root,
+            "recovery signer root differs from independently attested xpub"
+        );
+        ensure!(
+            descriptor.program.user_pubkey.to_string().eq_ignore_ascii_case(&expected.program.user_pubkey),
+            "recovery user public key differs from agreed owner"
+        );
         match bundle.readiness(point)? {
             ProgramRecoveryReadiness::Complete => {}
             ProgramRecoveryReadiness::Prepared => bail!("{} has incomplete prepared ancestors", point),
