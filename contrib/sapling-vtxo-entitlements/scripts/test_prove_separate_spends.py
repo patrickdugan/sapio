@@ -2,6 +2,8 @@
 import copy
 import unittest
 
+from live_core_wallet_smoke import make_simulated_report
+
 from prove_separate_spends import (
     signed_redemption,
     validate_report,
@@ -187,6 +189,37 @@ class ReportTests(unittest.TestCase):
         node.issued_fee = 5_000
         with self.assertRaises(ValueError):
             signed_redemption(node, receipt, "holder-alice", "bcrt1qtest", 2, 2_000)
+
+
+    def test_bitcoin_core_wallet_smoke_is_explicitly_synthetic(self):
+        alice = {
+            "holder": "alice",
+            "controlled": "3" * 64 + ":0",
+            "claim": A,
+            "witness": "a" * 64,
+            "outpoint": A + ":0",
+            "script": ALICE,
+            "amount": 60_000,
+            "confirmations": 6,
+        }
+        bob = {
+            "holder": "bob",
+            "controlled": "4" * 64 + ":0",
+            "claim": B,
+            "witness": "b" * 64,
+            "outpoint": B + ":1",
+            "script": BOB,
+            "amount": 40_000,
+            "confirmations": 6,
+        }
+        report = make_simulated_report([alice, bob])
+        self.assertEqual(report["fixture_kind"], "BITCOIN_CORE_WALLET_SMOKE_ONLY")
+        self.assertFalse(report["cryptographic_sapling_recovery_proven"])
+        self.assertEqual(len(validate_report(report)), 2)
+        bad = copy.deepcopy(report)
+        bad["two_holder"]["holders"][1]["payout_outpoint"] = bad["two_holder"]["holders"][0]["payout_outpoint"]
+        with self.assertRaises(ValueError):
+            validate_report(bad)
 
 
 if __name__ == "__main__":
