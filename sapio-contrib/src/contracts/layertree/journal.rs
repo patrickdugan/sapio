@@ -17,7 +17,7 @@
 
 use super::lineage::LineageGuard;
 use super::tree::{tree_spk, Leaf, Node, Tree};
-use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -71,6 +71,19 @@ impl TreeSnapshot {
     }
 }
 
+/// Witness-bearing transaction candidate persisted after obtaining signatures.
+///
+/// This record is not a Bitcoin consensus verifier. Its WTXID detects
+/// accidental witness-byte damage; a trusted full node must validate the
+/// actual spend before the bytes are broadcast or treated as confirmed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessedTransaction {
+    /// Bitcoin transaction including exactly the observed witness bytes.
+    pub transaction: Transaction,
+    /// SHA256d commitment to the entire serialized transaction and witnesses.
+    pub wtxid: Wtxid,
+}
+
 /// Exact unsigned Bitcoin transaction committed before releasing any signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigningReservation {
@@ -90,6 +103,9 @@ pub struct SigningReservation {
     pub current: TreeSnapshot,
     /// Canonical full member allocation after the proposed spend.
     pub successor: TreeSnapshot,
+    /// Optional witness-bearing candidate, written durably before broadcast.
+    #[serde(default)]
+    pub witnessed: Option<WitnessedTransaction>,
 }
 
 impl SigningReservation {
@@ -106,6 +122,15 @@ impl SigningReservation {
             || self.unsigned_tx.input.first().map(|input| input.previous_output) != Some(self.input)
         {
             return Err("saved unsigned Bitcoin transaction changed");
+        }
+        if let Some(witnessed) = &self.witnessed {
+            if witnessed.transaction.compute_txid() != self.txid
+                || witnessed.transaction.compute_wtxid() != witnessed.wtxid
+                || witnessed.transaction.input.first()
+                    .is_none_or(|input| input.witness.is_empty())
+            {
+                return Err("saved witness candidate has invalid bytes or changed transaction");
+            }
         }
         Ok((current, successor))
     }
@@ -226,6 +251,7 @@ impl LineageJournal {
             unsigned_tx: transaction.clone(),
             current: TreeSnapshot::from_tree(current),
             successor: TreeSnapshot::from_tree(next),
+            witnessed: None,
         });
         Ok(txid)
     }
@@ -260,6 +286,43 @@ impl LineageJournal {
             return Err("saved successor script commitment changed");
         }
         Ok(Some((current, successor, pending.unsigned_tx.clone())))
+    }
+
+    /// Save exactly one fully constructed, witness-bearing spend candidate.
+    ///
+    /// This method validates its non-witness transaction ID and stores a WTXID,
+    /// but it cannot evaluate Taproot signatures or confirm consensus validity.
+    /// Validation and broadcast belong to the trusted caller. Repeated calls
+    /// with identical bytes are idempotent; a competing candidate is rejected.
+    pub fn checkpoint_witnessed(&mut self, transaction: &Transaction)
+        -> Result<(), &'static str>
+    {
+        let pending = self.pending.as_mut()
+            .ok_or("cannot save witnesses without a pending signing reservation")?;
+        if transaction.compute_txid() != pending.txid
+            || transaction.input.first().is_none_or(|input| input.witness.is_empty())
+        {
+            return Err("witness candidate differs from reserved unsigned transaction");
+        }
+        let candidate = WitnessedTransaction {
+            transaction: transaction.clone(),
+            wtxid: transaction.compute_wtxid(),
+        };
+        if let Some(existing) = &pending.witnessed {
+            if existing != &candidate {
+                return Err("conflicting signed-witness candidate already checkpointed");
+            }
+        } else {
+            pending.witnessed = Some(candidate);
+        }
+        Ok(())
+    }
+
+    /// Read the saved witness-bearing bytes for independent verification and
+    /// possible re-broadcast following a process restart.
+    pub fn witnessed_candidate(&self) -> Option<&Transaction> {
+        self.pending.as_ref().and_then(|pending|
+            pending.witnessed.as_ref().map(|stored| &stored.transaction))
     }
 
     /// After independently authenticating the confirmed txid, advance using
@@ -465,6 +528,22 @@ impl LockedLineage {
             ));
         }
         self.state.permit(transaction).map_err(invalid)
+    }
+
+    /// Atomically save a completed transaction's witnesses under the same
+    /// process lock and write-before-broadcast journal discipline.
+    pub fn checkpoint_witnessed(&mut self, transaction: &Transaction) -> io::Result<()> {
+        if self.poisoned {
+            return Err(invalid("uncertain LayerTree journal write; reopen after recovery"));
+        }
+        let mut proposed = self.state.clone();
+        proposed.checkpoint_witnessed(transaction).map_err(invalid)?;
+        if let Err(error) = persist(&self.path, &proposed) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.state = proposed;
+        Ok(())
     }
 
     /// Confirm from the complete saved reservation after an independent chain
