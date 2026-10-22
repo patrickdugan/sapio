@@ -30,6 +30,30 @@ this risk. This fork adds a direct oracle regression rather than claiming a
 new consensus vulnerability. The test proves the consequence *within the
 experimental emulator* and its explicitly stated oracle trust model.
 
+## Crash-complete signing reservations
+
+The signing journal is now **schema v2**. Each pending authorization saves the
+exact unsigned Bitcoin transaction, its authenticated previous output and the
+complete canonical before/after member allocations. The recorded Merkle roots
+can be recomputed from the recovered leaf records after process loss.
+
+`LockedLineage::open()` checks the saved transaction ID, canonical predecessor
+and successor scripts, and the historical voucher identity policy. Corrupted
+or reordered member snapshots fail closed. A coordinator can call
+`saved_pending()` to retrieve complete allocation trees or
+`confirm_saved(txid)` after independently verifying that exact transaction
+has reached sufficient Bitcoin confirmations.
+
+A v1 journal lacks the full snapshots and fails closed on open. Prior
+experimental v1 state needs reconciliation using separately saved wallet
+records before migration. Complete v2 snapshots grow with tree occupancy,
+which adds disk writes and storage per pending authorization.
+
+The persisted transaction is **unsigned**. Its body and entitlement state
+survive a crash, while broadcasting still requires a separately preserved
+signed transaction or another valid signing session. A chain observer must
+authenticate confirmation before the coordinator calls `confirm_saved`.
+
 ## Application-side prevention
 
 `sapio_contrib::contracts::layertree::LineageGuard` provides a serializable
