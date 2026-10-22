@@ -298,6 +298,33 @@ loopback ports must be unreachable after shutdown. Before each wallet
 redemption, the Python runner rechecks the current chain's witness hash
 and required confirmation depth against the saved signed recovery.
 
+### Independence of the Bitcoin fee sponsor
+
+Both real-service scenarios now fund a third SaplingOS wallet,
+`external-recovery-fees`, before the outage. Its wallet seed and
+on-chain SQLite database are separate from Alice and Bob, and it
+holds no Ark VTXOs. The fixture stops this sponsor's original
+process alongside both owners and the signing services.
+
+When each saved bundle is replayed, an **independent fresh-process
+fee wallet** opens the sponsor's seed and database and passes its
+ordinary Bitcoin coins to SaplingOS's native
+`recover_program_bundle()`. Neither claimant wallet needs to be
+reopened to authorize or pay the recovery transactions.
+
+The fixture records the sponsor's originally confirmed UTXOs in
+`external-fee-utxos-before-shutdown.json` and recursively checks
+the external inputs of both confirmed P2A children. Every intervening
+fee-change transaction must spend a P2A anchor belonging to the
+**signed saved recovery transactions**, and its non-anchor funding
+must eventually trace back to the pre-shutdown sponsor coins. Shared
+signed ancestors between Alice and Bob are accepted. An unrelated
+wallet coin or recovery-beneficiary input fails the run.
+
+This tests external fee independence from the holders and Ark
+signing infrastructure, with the same trusted Bitcoin Core regtest
+node underlying all participants.
+
 The pinned upstream fixture uses a **local-dev TEE**, meaning no
 hardware-attestation assurance is claimed. The default two-holder test uses **separately boarded VTXOs**. The
 optional common-root sibling fixture tests shared signed ancestry. A
