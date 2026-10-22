@@ -303,6 +303,32 @@ must prepare and save immutable claims before deliberately shutting it down.
 The separate Ark server, Bitcoin Core, CLN, PostgreSQL and watchman
 fixture binaries remain required by the native SaplingOS service suite.
 
+### Preparing the remaining regtest fixture binaries
+
+After the [locked Sapio TEE bootstrap](scripts/bootstrap_localdev_tee.sh),
+run the [external fixture bootstrap](scripts/bootstrap_regtest_fixtures.sh)
+on a disposable Ubuntu 24.04 / Linux x86_64 machine with Nix, Git,
+protobuf, OpenSSL/libpq development libraries, and PostgreSQL 16 installed:
+
+```sh
+bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh
+bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh
+```
+
+Copy the `export` assignments printed by both scripts into the same shell
+before running `run_real_two_holder.sh`. The second bootstrap pins
+`stutxo/saplingos@b45e5ef`, `ark-bitcoin/bark@626c9b`, and
+`BoltzExchange/hold@af0055`, compiles the Bark server/watchman and the
+hold plugin, and verifies release hashes of Bitcoin Core 30.3 and Core
+Lightning 26.06.7. The Lightning release's gRPC plugin is included.
+The preflight job checks the public source revisions and official CLN
+archive layout. Its checksum is sourced from that release's GitHub
+asset digest. Rebuilding service binaries may consume substantial CPU
+and storage; the local-dev keys and Bitcoin balances remain disposable.
+
+These scripts provision binaries and print their paths. The native
+SaplingOS fixture itself creates its own Bitcoin, Ark and CLN test data
+and runs the actual recovery only when `run_real_two_holder.sh` is invoked.
 ## Running the genuine two-holder service-shutdown fixture
 
 An opt-in integration test at
