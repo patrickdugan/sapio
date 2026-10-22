@@ -700,10 +700,15 @@ mod tests {
         journal.reserve(&tree, &after, &prevout, &tx).unwrap();
         let mut raw = serde_json::to_value(journal).unwrap();
         raw["version"] = serde_json::Value::from(1);
-        let restored: LineageJournal = serde_json::from_value(raw).unwrap();
-        // On-disk loaders reject v1, which lacks the full replayable state.
-        assert_ne!(restored.version, JOURNAL_VERSION);
-        assert!(restored.saved_pending().unwrap().is_some());
+        let path = std::env::temp_dir().join(format!(
+            "sapio-obsolete-journal-{}-{}.json",
+            std::process::id(),
+            TEMP_NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert!(LockedLineage::open(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path)).unwrap();
     }
 
     #[test]
