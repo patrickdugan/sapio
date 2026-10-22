@@ -650,12 +650,14 @@ fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
     .unwrap();
     let first_tx = example::finish(&first, &example::oracle().unwrap()).unwrap();
     assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    wallet.checkpoint_witnessed(&first_tx).unwrap();
     assert_eq!(first_tx.output[1], example::payout(&alice));
     // The wallet process disappears after authorization, before confirmation.
     drop(wallet);
 
     let mut wallet = LockedLineage::open(&path).unwrap();
     assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    assert_eq!(wallet.state().witnessed_candidate(), Some(&first_tx));
     let (saved_before, saved_successor, saved_unsigned) =
         wallet.state().saved_pending().unwrap().unwrap();
     assert_eq!(saved_before.root(), tree.root());
@@ -692,6 +694,7 @@ fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
     .unwrap();
     let second_tx = example::finish(&second, &example::oracle().unwrap()).unwrap();
     assert_eq!(wallet.permit(&second_tx).unwrap(), second_tx.compute_txid());
+    wallet.checkpoint_witnessed(&second_tx).unwrap();
     assert_eq!(second_tx.output[1], example::payout(&bob));
     wallet.confirm_saved(second_tx.compute_txid()).unwrap();
     assert_eq!(wallet.state().root(), Node::empty(2));
