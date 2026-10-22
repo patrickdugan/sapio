@@ -235,6 +235,51 @@ holder-wallet spend runner come **after** those Bitcoin confirmations.
 Keep a separate service-stop log and fee-wallet funding record. They are
 not attested by either verifier.
 
+
+## Running the genuine two-holder service-shutdown fixture
+
+An opt-in integration test at
+`e2e/sapio_two_holder.rs` exercises a live SaplingOS TEE and Ark server
+with real Bitcoin Core regtest transactions. The Bash driver builds the
+standalone merger and auditor, creates a disposable detached Git worktree
+of the **pinned upstream SaplingOS commit**, injects the test module into
+upstream's existing integration suite, and runs the native offline SDK
+recovery subprocesses. It leaves the original upstream checkout untouched.
+
+Set `SAPLINGOS_CHECKOUT` to a local Git checkout containing
+`b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d`. The real-service
+fixture binaries and WASM artifacts required by upstream
+[BUILDING.md](https://github.com/stutxo/saplingos/blob/b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d/BUILDING.md)
+must be available: `CAPTAIND_EXEC`, `WATCHMAND_EXEC`,
+`BITCOIND_EXEC`, `POSTGRES_BINS`, `LIGHTNINGD_EXEC`,
+`LIGHTNINGD_PLUGIN_DIR`, `SAPIO_TEE_EXEC`, and
+`SAPIO_TEMPLATEHASH_WASM`. Provide a matching
+`SAPLING_TWO_HOLDER_BITCOIN_CLI` and the Nix, just, and Rust
+toolchains used by the pinned SDK.
+
+```sh
+SAPLINGOS_CHECKOUT=/absolute/path/to/saplingos \
+SAPLING_TWO_HOLDER_BITCOIN_CLI=/absolute/path/to/bitcoin-cli \
+bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
+```
+
+The driver also accepts `SAPLING_TWO_HOLDER_CAPTURE_DIR`; otherwise it
+chooses a new private directory under the user's local state home.
+It fails if that directory already contains signed holder exports.
+The real test records independent program identifiers and exact scripts
+before exporting the signed evidence, confirms each claim while both
+services are stopped, invokes the actual merged-bundle auditor with
+`--two-holder`, and signs separate PSBT redemptions using Bitcoin Core
+wallets `alice-recovered` and `bob-recovered` with their own keys.
+A single regtest block confirms both spends. The saved audit is explicitly
+**pre-spend** and the redemption receipt is **post-spend**.
+
+The pinned upstream fixture uses a **local-dev TEE**, meaning no
+hardware-attestation assurance is claimed. This initial two-holder test
+uses **separately boarded VTXOs**; a common-root shared-ancestry fixture
+is a subsequent test. The real integration requires external service
+binaries and has not been run by the lightweight dedicated CI.
+
 ## Verification boundaries
 
 A successful report means the existing SaplingOS cryptographic verifier
