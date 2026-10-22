@@ -57,12 +57,63 @@ async fn capture_fee_wallet_funding(wallet: &sapling::Wallet) -> HashSet<OutPoin
     coins
 }
 
-/// CPFP must originate from the recorded third wallet's confirmed UTXOs.
-/// The second claim may reuse change from the first, already-mined fee child.
+/// Every fee input is traced to a UTXO that was in the independent
+/// sponsor wallet before the cosigner disappeared. A change output may
+/// pass through several previously confirmed P2A fee children while Ark
+/// recovery ancestors mature on Bitcoin Core.
+fn selected_recovery_anchors(bundles: &[&ProgramRecoveryBundle]) -> HashSet<OutPoint> {
+    let mut anchors = HashSet::new();
+    for bundle in bundles {
+        for target in &bundle.targets {
+            let record = bundle.recoveries.iter()
+                .find(|record| record.controlled_outpoint == *target)
+                .expect("selected VTXO has no signed recovery record");
+            assert_eq!(bundle.readiness(*target).unwrap(), ProgramRecoveryReadiness::Complete);
+            for tx in record.ancestors.iter().chain(std::iter::once(&record.claim)) {
+                let matches = tx.output.iter().enumerate().filter(|(_, output)| {
+                    output.value == Amount::ZERO
+                        && output.script_pubkey.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
+                }).map(|(i, _)| OutPoint::new(tx.compute_txid(), i as u32))
+                    .collect::<Vec<_>>();
+                assert_eq!(matches.len(), 1, "signed recovery transaction has no unique P2A anchor");
+                assert!(anchors.insert(matches[0]), "P2A anchor duplicated in signed bundle");
+            }
+        }
+    }
+    anchors
+}
+
+fn trace_sponsor_coin(
+    ctx: &TestContext,
+    coin: OutPoint,
+    initial: &HashSet<OutPoint>,
+    recovery_anchors: &HashSet<OutPoint>,
+    seen: &mut HashSet<OutPoint>,
+) {
+    if initial.contains(&coin) { return; }
+    assert!(seen.insert(coin), "cyclic or repeated intermediate fee provenance");
+    assert!(seen.len() <= 64, "unreasonably deep external fee ancestry");
+    let tx = ctx.bitcoind().sync_client().get_raw_transaction(&coin.txid, None)
+        .expect("fee change parent is missing from Bitcoin Core");
+    let output = tx.output.get(coin.vout as usize).expect("missing fee change output");
+    assert!(output.value > Amount::ZERO, "fee change outpoint is zero valued");
+    assert!(tx.input.iter().any(|input| recovery_anchors.contains(&input.previous_output)),
+        "fee input did not originate from a signed recovery P2A fee child");
+    let from_fees = tx.input.iter()
+        .map(|input| input.previous_output)
+        .filter(|input| !recovery_anchors.contains(input))
+        .collect::<Vec<_>>();
+    assert!(!from_fees.is_empty(), "P2A child lacks funded inputs");
+    for parent in from_fees {
+        trace_sponsor_coin(ctx, parent, initial, recovery_anchors, seen);
+    }
+}
+
 fn require_external_fee_wallet_funding(
+    ctx: &TestContext,
     proof: &serde_json::Value,
     initial: &HashSet<OutPoint>,
-    prior_child: Option<&str>,
+    recovery_anchors: &HashSet<OutPoint>,
 ) {
     let external = proof["external_fee_inputs"].as_array()
         .expect("missing external funding inputs");
@@ -70,9 +121,7 @@ fn require_external_fee_wallet_funding(
     for item in external {
         let point: OutPoint = item.as_str().expect("non-string sponsor input")
             .parse().expect("invalid external sponsor outpoint");
-        let carried_change = prior_child.is_some_and(|txid| point.txid.to_string() == txid);
-        assert!(initial.contains(&point) || carried_change,
-            "fee input {point} did not originate from the separately funded sponsor");
+        trace_sponsor_coin(ctx, point, initial, recovery_anchors, &mut HashSet::new());
     }
 }
 
@@ -341,9 +390,9 @@ async fn sapio_real_two_holder_offline_recovery() {
 
     let alice_fee_child = observed_fee_child(&ctx, &bundle_a);
     let bob_fee_child = observed_fee_child(&ctx, &bundle_b);
-    require_external_fee_wallet_funding(&alice_fee_child, &sponsor_coins, None);
-    require_external_fee_wallet_funding(&bob_fee_child, &sponsor_coins,
-        alice_fee_child["fee_child_txid"].as_str());
+    let recovery_anchors = selected_recovery_anchors(&[&bundle_a, &bundle_b]);
+    require_external_fee_wallet_funding(&ctx, &alice_fee_child, &sponsor_coins, &recovery_anchors);
+    require_external_fee_wallet_funding(&ctx, &bob_fee_child, &sponsor_coins, &recovery_anchors);
     let fee_proof = json!({
         "alice": alice_fee_child,
         "bob": bob_fee_child,
@@ -594,9 +643,9 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
 
     let alice_fee_child = observed_fee_child(&ctx, &bundle_a);
     let bob_fee_child = observed_fee_child(&ctx, &bundle_b);
-    require_external_fee_wallet_funding(&alice_fee_child, &sponsor_coins, None);
-    require_external_fee_wallet_funding(&bob_fee_child, &sponsor_coins,
-        alice_fee_child["fee_child_txid"].as_str());
+    let recovery_anchors = selected_recovery_anchors(&[&bundle_a, &bundle_b]);
+    require_external_fee_wallet_funding(&ctx, &alice_fee_child, &sponsor_coins, &recovery_anchors);
+    require_external_fee_wallet_funding(&ctx, &bob_fee_child, &sponsor_coins, &recovery_anchors);
     let fee_proof = json!({
         "alice": alice_fee_child,
         "bob": bob_fee_child,
