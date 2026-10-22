@@ -40,7 +40,20 @@ fn script_hex(script: &ScriptBuf) -> String {
 }
 
 fn save_json(path: &Path, value: &impl serde::Serialize) {
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    // Bundles contain sensitive signer metadata and immutable claim evidence.
+    // Create a new private file so an older signed export is never overwritten.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).expect("create new private fixture artifact");
+    serde_json::to_writer_pretty(&mut file, value).unwrap();
+    use std::io::Write;
+    file.write_all(b"\n").unwrap();
+    file.sync_all().unwrap();
 }
 
 /// The recovery sponsor has its own BIP39 seed, SQLite database and
@@ -342,6 +355,11 @@ async fn sapio_real_two_holder_offline_recovery() {
         .map(PathBuf::from)
         .unwrap_or_else(|| ctx.datadir.join("two-holder-capture"));
     fs::create_dir_all(&artifact_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&artifact_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut sponsor_points = sponsor_coins.iter().map(ToString::to_string)
         .collect::<Vec<_>>();
     sponsor_points.sort();
@@ -581,6 +599,11 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         .map(PathBuf::from)
         .unwrap_or_else(|| ctx.datadir.join("two-holder-common-anchor"));
     fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut sponsor_points = sponsor_coins.iter().map(ToString::to_string)
         .collect::<Vec<_>>();
     sponsor_points.sort();
