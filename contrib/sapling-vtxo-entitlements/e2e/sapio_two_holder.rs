@@ -13,6 +13,7 @@ use super::*;
 use bitcoin::address::NetworkUnchecked;
 use bitcoincore_rpc::{Auth, Client, RpcApi as _};
 use serde_json::json;
+use std::collections::HashSet;
 use std::fs;
 
 fn new_recipient_wallet(ctx: &TestContext, name: &str) -> (Client, ScriptBuf) {
@@ -40,6 +41,39 @@ fn script_hex(script: &ScriptBuf) -> String {
 
 fn save_json(path: &Path, value: &impl serde::Serialize) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+/// The recovery sponsor has its own BIP39 seed, SQLite database and
+/// confirmed ordinary Bitcoin inputs. It carries no Sapio program signing keys.
+async fn capture_fee_wallet_funding(wallet: &sapling::Wallet) -> HashSet<OutPoint> {
+    let onchain = wallet.onchain().expect("fee wallet must have a Bitcoin wallet");
+    let onchain = onchain.read().await;
+    let bdk = (&*onchain as &dyn std::any::Any)
+        .downcast_ref::<sapling::onchain::OnchainWallet>()
+        .expect("real BDK wallet required for fee provenance");
+    let coins = bdk.list_unspent().into_iter().map(|coin| coin.outpoint)
+        .collect::<HashSet<_>>();
+    assert!(!coins.is_empty(), "separate recovery fee wallet has no funded Bitcoin inputs");
+    coins
+}
+
+/// CPFP must originate from the recorded third wallet's confirmed UTXOs.
+/// The second claim may reuse change from the first, already-mined fee child.
+fn require_external_fee_wallet_funding(
+    proof: &serde_json::Value,
+    initial: &HashSet<OutPoint>,
+    prior_child: Option<&str>,
+) {
+    let external = proof["external_fee_inputs"].as_array()
+        .expect("missing external funding inputs");
+    assert!(!external.is_empty(), "recovery sponsor paid no external funds");
+    for item in external {
+        let point: OutPoint = item.as_str().expect("non-string sponsor input")
+            .parse().expect("invalid external sponsor outpoint");
+        let carried_change = prior_child.is_some_and(|txid| point.txid.to_string() == txid);
+        assert!(initial.contains(&point) || carried_change,
+            "fee input {point} did not originate from the separately funded sponsor");
+    }
 }
 
 fn assert_saved_claim(
@@ -171,6 +205,11 @@ async fn sapio_real_two_holder_offline_recovery() {
     let tee = SapioTee::launch(&ctx).await;
     let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
         .funded(btc(1)).create().await;
+    let fee_wallet = ctx.sdk("external-recovery-fees", &srv)
+        .funded(sat(800_000)).cfg(|c| c.daemon_manual_sync = true).create().await;
+    assert!(fee_wallet.spendable_vtxos().await.unwrap().is_empty(),
+        "recovery sponsor must have no Ark VTXOs");
+    let sponsor_coins = capture_fee_wallet_funding(&fee_wallet).await;
 
     // Key custody is independent and observable through Bitcoin Core.
     let (alice_recipient, alice_script) = new_recipient_wallet(&ctx, "alice-recovered");
@@ -247,6 +286,10 @@ async fn sapio_real_two_holder_offline_recovery() {
         .map(PathBuf::from)
         .unwrap_or_else(|| ctx.datadir.join("two-holder-capture"));
     fs::create_dir_all(&artifact_dir).unwrap();
+    let mut sponsor_points = sponsor_coins.iter().map(ToString::to_string)
+        .collect::<Vec<_>>();
+    sponsor_points.sort();
+    save_json(&artifact_dir.join("external-fee-utxos-before-shutdown.json"), &sponsor_points);
     let terms_file = artifact_dir.join("two-holder-terms.json");
     save_json(&terms_file, &terms);
 
@@ -266,6 +309,8 @@ async fn sapio_real_two_holder_offline_recovery() {
     // signed Bitcoin recovery evidence in a fresh OS process.
     alice.stop_daemon_wait().await.unwrap();
     bob.stop_daemon_wait().await.unwrap();
+    fee_wallet.stop_daemon_wait().await.unwrap();
+    drop(fee_wallet);
     drop(alice);
     drop(bob);
     tee.stop().await.unwrap();
@@ -278,12 +323,12 @@ async fn sapio_real_two_holder_offline_recovery() {
     // Confirm Alice without Bob's wallet; then confirm Bob independently.
     // Both use the pinned SDK's ordinary, externally funded fee wallet and
     // validate exact P2A children, native CSV/CLTV and Bitcoin Core confirmations.
-    recover_offline(&ctx, "alice", Some(&alice_file), &bundle_a).await;
+    recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
     assert!(ctx.bitcoind().sync_client()
         .get_raw_transaction(&bundle_b.recoveries[0].claim.compute_txid(), None).is_err(),
         "Bob's recovery published without Bob initiating recovery");
-    recover_offline(&ctx, "bob", Some(&bob_file), &bundle_b).await;
+    recover_offline(&ctx, "external-recovery-fees", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
 
     // Reach an independently chosen 6-confirmation policy before redemption.
@@ -294,9 +339,16 @@ async fn sapio_real_two_holder_offline_recovery() {
             .confirmations.unwrap_or(0) >= 6);
     }
 
+    let alice_fee_child = observed_fee_child(&ctx, &bundle_a);
+    let bob_fee_child = observed_fee_child(&ctx, &bundle_b);
+    require_external_fee_wallet_funding(&alice_fee_child, &sponsor_coins, None);
+    require_external_fee_wallet_funding(&bob_fee_child, &sponsor_coins,
+        alice_fee_child["fee_child_txid"].as_str());
     let fee_proof = json!({
-        "alice": observed_fee_child(&ctx, &bundle_a),
-        "bob": observed_fee_child(&ctx, &bundle_b),
+        "alice": alice_fee_child,
+        "bob": bob_fee_child,
+        "external_fee_wallet": "external-recovery-fees",
+        "external_fee_wallet_keys_distinct_from_holders": true,
         "services_offline_when_fee_children_mined": true,
     });
     save_json(&artifact_dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
@@ -373,6 +425,11 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let tee = SapioTee::launch(&ctx).await;
     let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
         .funded(btc(1)).create().await;
+    let fee_wallet = ctx.sdk("external-recovery-fees", &srv)
+        .funded(sat(800_000)).cfg(|c| c.daemon_manual_sync = true).create().await;
+    assert!(fee_wallet.spendable_vtxos().await.unwrap().is_empty(),
+        "recovery sponsor must have no Ark VTXOs");
+    let sponsor_coins = capture_fee_wallet_funding(&fee_wallet).await;
 
     // One genuine funded root VTXO is split by sequential native Ark
     // transfers to two *different* Sapio program-wallet recipients.
@@ -464,6 +521,10 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         .map(PathBuf::from)
         .unwrap_or_else(|| ctx.datadir.join("two-holder-common-anchor"));
     fs::create_dir_all(&dir).unwrap();
+    let mut sponsor_points = sponsor_coins.iter().map(ToString::to_string)
+        .collect::<Vec<_>>();
+    sponsor_points.sort();
+    save_json(&dir.join("external-fee-utxos-before-shutdown.json"), &sponsor_points);
     let terms_file = dir.join("two-holder-terms.json");
     save_json(&terms_file, &terms);
 
@@ -485,7 +546,9 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     // Stop every signer and every owner SDK before recovery publication.
     alice.stop_daemon_wait().await.unwrap();
     bob.stop_daemon_wait().await.unwrap();
+    fee_wallet.stop_daemon_wait().await.unwrap();
     sender.stop_daemon_wait().await.unwrap();
+    drop(fee_wallet);
     drop(alice);
     drop(bob);
     drop(sender);
@@ -529,12 +592,19 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     assert_eq!(report["two_holder"]["holders"].as_array().unwrap().len(), 2);
     save_json(&dir.join("two-holder-pre-spend-report.json"), &report);
 
+    let alice_fee_child = observed_fee_child(&ctx, &bundle_a);
+    let bob_fee_child = observed_fee_child(&ctx, &bundle_b);
+    require_external_fee_wallet_funding(&alice_fee_child, &sponsor_coins, None);
+    require_external_fee_wallet_funding(&bob_fee_child, &sponsor_coins,
+        alice_fee_child["fee_child_txid"].as_str());
     let fee_proof = json!({
-        "alice":observed_fee_child(&ctx, &bundle_a),
-        "bob":observed_fee_child(&ctx, &bundle_b),
-        "shared_chain_anchor":anchor.to_string(),
-        "real_common_root":true,
-        "services_offline_when_fee_children_mined":true
+        "alice": alice_fee_child,
+        "bob": bob_fee_child,
+        "external_fee_wallet": "external-recovery-fees",
+        "external_fee_wallet_keys_distinct_from_holders": true,
+        "shared_chain_anchor": anchor.to_string(),
+        "real_common_root": true,
+        "services_offline_when_fee_children_mined": true
     });
     save_json(&dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
 
