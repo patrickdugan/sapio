@@ -611,11 +611,14 @@ mod tests {
         {
             let mut recovered = LockedLineage::open(&path).unwrap();
             assert_eq!(recovered.permit(&tx).unwrap(), tx.compute_txid());
+            let (saved_before, saved_next, unsigned) =
+                recovered.state().saved_pending().unwrap().unwrap();
+            assert_eq!(saved_before.root(), tree.root());
+            assert_eq!(saved_next.root(), after.root());
+            assert_eq!(unsigned, tx);
             assert!(recovered.reserve(&tree, &after, &prevout, &tx).is_err());
-            assert!(recovered
-                .confirm(bitcoin::Txid::from_byte_array([9; 32]), &tree, &after)
-                .is_err());
-            recovered.confirm(tx.compute_txid(), &tree, &after).unwrap();
+            assert!(recovered.confirm_saved(bitcoin::Txid::from_byte_array([9; 32])).is_err());
+            recovered.confirm_saved(tx.compute_txid()).unwrap();
         }
         {
             let recovered = LockedLineage::open(&path).unwrap();
@@ -661,6 +664,46 @@ mod tests {
         let tx = transaction(&journal, &after);
         assert!(journal.reserve(&tree, &after, &wrong_prevout, &tx).is_err());
         assert!(journal.pending().is_none());
+    }
+
+    #[test]
+    fn corrupted_saved_member_snapshots_are_rejected_at_process_restart() {
+        let (journal, tree, prevout) = setup();
+        let path = std::env::temp_dir().join(format!(
+            "sapio-corrupted-journal-{}-{}.json",
+            std::process::id(),
+            TEMP_NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut after = tree.clone();
+        after.set(0, None).unwrap();
+        let tx = transaction(&journal, &after);
+        {
+            let mut disk = LockedLineage::create(&path, journal).unwrap();
+            disk.reserve(&tree, &after, &prevout, &tx).unwrap();
+        }
+        let mut bytes: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        bytes["pending"]["successor"]["leaves"][0][1]["amount"] =
+            serde_json::Value::from(40_001);
+        fs::write(&path, serde_json::to_vec(&bytes).unwrap()).unwrap();
+        assert!(LockedLineage::open(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path)).unwrap();
+    }
+
+    #[test]
+    fn journal_version_rejection_preserves_pending_intent() {
+        let (mut journal, tree, prevout) = setup();
+        let mut after = tree.clone();
+        after.set(0, None).unwrap();
+        let tx = transaction(&journal, &after);
+        journal.reserve(&tree, &after, &prevout, &tx).unwrap();
+        let mut raw = serde_json::to_value(journal).unwrap();
+        raw["version"] = serde_json::Value::from(1);
+        let restored: LineageJournal = serde_json::from_value(raw).unwrap();
+        // On-disk loaders reject v1, which lacks the full replayable state.
+        assert_ne!(restored.version, JOURNAL_VERSION);
+        assert!(restored.saved_pending().unwrap().is_some());
     }
 
     #[test]
