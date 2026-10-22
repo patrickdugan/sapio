@@ -173,11 +173,7 @@ impl LineageJournal {
             .as_ref()
             .ok_or("no pending LayerTree signing reservation")?;
         if transaction.compute_txid() != pending.txid
-            || transaction
-                .input
-                .first()
-                .map(|input| input.previous_output)
-                != Some(pending.input)
+            || transaction.input.first().map(|input| input.previous_output) != Some(pending.input)
         {
             return Err("signing transaction differs from reserved LayerTree intent");
         }
@@ -189,12 +185,7 @@ impl LineageJournal {
     /// This method checks the pending intent's exact txid and successor root.
     /// The caller is responsible for proof of confirmation and chain ancestry.
     /// An unrelated winning transaction cannot be silently made canonical.
-    pub fn confirm(
-        &mut self,
-        txid: Txid,
-        current: &Tree,
-        next: &Tree,
-    ) -> Result<(), &'static str> {
+    pub fn confirm(&mut self, txid: Txid, current: &Tree, next: &Tree) -> Result<(), &'static str> {
         let pending = self
             .pending
             .as_ref()
@@ -311,8 +302,8 @@ impl LockedLineage {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let lock = Self::acquire(&path)?;
-        let state: LineageJournal = serde_json::from_slice(&fs::read(&path)?)
-            .map_err(invalid_data)?;
+        let state: LineageJournal =
+            serde_json::from_slice(&fs::read(&path)?).map_err(invalid_data)?;
         if state.version != JOURNAL_VERSION {
             return Err(invalid("unsupported LayerTree journal version"));
         }
@@ -339,7 +330,9 @@ impl LockedLineage {
         transaction: &Transaction,
     ) -> io::Result<Txid> {
         if self.poisoned {
-            return Err(invalid("uncertain LayerTree journal write; reopen after recovery"));
+            return Err(invalid(
+                "uncertain LayerTree journal write; reopen after recovery",
+            ));
         }
         let mut proposed = self.state.clone();
         let txid = proposed
@@ -356,7 +349,9 @@ impl LockedLineage {
     /// Verify the exact unsigned transaction following the successful sync.
     pub fn permit(&self, transaction: &Transaction) -> io::Result<Txid> {
         if self.poisoned {
-            return Err(invalid("uncertain LayerTree journal write; reopen after recovery"));
+            return Err(invalid(
+                "uncertain LayerTree journal write; reopen after recovery",
+            ));
         }
         self.state.permit(transaction).map_err(invalid)
     }
@@ -365,7 +360,9 @@ impl LockedLineage {
     /// reserved exact transaction. The user must authenticate that confirmation.
     pub fn confirm(&mut self, txid: Txid, current: &Tree, next: &Tree) -> io::Result<()> {
         if self.poisoned {
-            return Err(invalid("uncertain LayerTree journal write; reopen after recovery"));
+            return Err(invalid(
+                "uncertain LayerTree journal write; reopen after recovery",
+            ));
         }
         let mut proposed = self.state.clone();
         proposed.confirm(txid, current, next).map_err(invalid)?;
@@ -380,8 +377,8 @@ impl LockedLineage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tree::NUMS;
+    use super::*;
     use bitcoin::hashes::{sha256, Hash};
     use bitcoin::secp256k1::XOnlyPublicKey;
     use bitcoin::{Amount, Sequence, TxIn};
@@ -455,7 +452,9 @@ mod tests {
         assert!(journal.permit(&redirect).is_err());
         assert_eq!(journal.permit(&tx).unwrap(), txid);
         assert!(journal.reserve(&tree, &after, &prevout, &tx).is_err());
-        assert!(journal.confirm(redirect.compute_txid(), &tree, &after).is_err());
+        assert!(journal
+            .confirm(redirect.compute_txid(), &tree, &after)
+            .is_err());
         assert!(journal.pending().is_some());
         journal.confirm(txid, &tree, &after).unwrap();
         assert_eq!(journal.root().sum, 40_000);
@@ -513,7 +512,9 @@ mod tests {
             value: Amount::from_sat(40_000),
             script_pubkey: tree_spk(exited.root().hash, [8; 32]).unwrap(),
         };
-        assert!(journal.reserve(&exited, &replay, &new_prevout, &synthetic).is_err());
+        assert!(journal
+            .reserve(&exited, &replay, &new_prevout, &synthetic)
+            .is_err());
     }
 
     #[test]
@@ -522,10 +523,7 @@ mod tests {
         let mut after = tree.clone();
         after.set(0, None).unwrap();
         let mut tx = transaction(&journal, &after);
-        tx.input[0].previous_output = OutPoint::new(
-            bitcoin::Txid::from_byte_array([5; 32]),
-            0,
-        );
+        tx.input[0].previous_output = OutPoint::new(bitcoin::Txid::from_byte_array([5; 32]), 0);
         assert!(journal.reserve(&tree, &after, &prevout, &tx).is_err());
         let mut wrong_prevout = prevout.clone();
         wrong_prevout.script_pubkey = ScriptBuf::new();
@@ -546,6 +544,8 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
         };
         let attempt = transaction(&journal, &tree);
-        assert!(journal.reserve(&empty, &tree, &new_prevout, &attempt).is_err());
+        assert!(journal
+            .reserve(&empty, &tree, &new_prevout, &attempt)
+            .is_err());
     }
 }

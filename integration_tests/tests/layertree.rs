@@ -666,10 +666,13 @@ fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
         98,
         &mut wallet,
         |sign, m| witness::exit(&tree, &[(0, false, sign(&example::key(210)))], m),
-    ).is_err());
+    )
+    .is_err());
     // A real coordinator must check the confirmed txid with Bitcoin Core.
     // We model that authenticated notification here.
-    wallet.confirm(first_tx.compute_txid(), &tree, &first.next).unwrap();
+    wallet
+        .confirm(first_tx.compute_txid(), &tree, &first.next)
+        .unwrap();
 
     let second_coin = successor(&first_tx);
     let second = example::prepare_step_reserved(
@@ -681,19 +684,15 @@ fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
         0,
         99,
         &mut wallet,
-        |sign, m| {
-            witness::exit(
-                &first.next,
-                &[(1, false, sign(&example::key(211)))],
-                m,
-            )
-        },
+        |sign, m| witness::exit(&first.next, &[(1, false, sign(&example::key(211)))], m),
     )
     .unwrap();
     let second_tx = example::finish(&second, &example::oracle().unwrap()).unwrap();
     assert_eq!(wallet.permit(&second_tx).unwrap(), second_tx.compute_txid());
     assert_eq!(second_tx.output[1], example::payout(&bob));
-    wallet.confirm(second_tx.compute_txid(), &first.next, &second.next).unwrap();
+    wallet
+        .confirm(second_tx.compute_txid(), &first.next, &second.next)
+        .unwrap();
     assert_eq!(wallet.state().root(), Node::empty(2));
     assert!(wallet.state().pending().is_none());
     drop(wallet);
@@ -719,13 +718,9 @@ fn signing_failure_after_fsync_leaves_a_sticky_reservation() {
     let coin = principal(&contract, &tree, 102);
     let compiled = example::compile(&contract, &tree).unwrap();
     let script_root = sapio_contrib::contracts::layertree::script_tree_root(&compiled).unwrap();
-    let journal = LineageJournal::bootstrap(
-        contract.config().tree_id,
-        script_root,
-        coin.outpoint,
-        &tree,
-    )
-    .unwrap();
+    let journal =
+        LineageJournal::bootstrap(contract.config().tree_id, script_root, coin.outpoint, &tree)
+            .unwrap();
     let path = std::env::temp_dir().join(format!(
         "layertree-crash-reserve-{}-{}.json",
         std::process::id(),

@@ -16,7 +16,8 @@ use sapio::contract::{Compiled, Context};
 use sapio_base::effects::MapEffectDB;
 use sapio_base::secp::secp;
 use sapio_contrib::contracts::layertree::{
-    script_tree_root, tree, witness, Config, LayerTree, Leaf, LineageGuard, LockedLineage, Transition, Tree,
+    script_tree_root, tree, witness, Config, LayerTree, Leaf, LineageGuard, LockedLineage,
+    Transition, Tree,
 };
 use std::sync::Arc;
 
@@ -192,11 +193,12 @@ pub fn prepare_step_reserved(
     plan: impl Fn(&dyn Fn(&Keypair) -> Vec<u8>, [u8; 32]) -> Result<witness::Prepared, &'static str>,
 ) -> Result<Step, Error> {
     let prevout = principal.txout.clone();
-    let mut write_before_sign = |transaction: &Transaction, successor: &Tree| -> Result<(), Error> {
-        journal.reserve(current, successor, &prevout, transaction)?;
-        journal.permit(transaction)?;
-        Ok(())
-    };
+    let mut write_before_sign =
+        |transaction: &Transaction, successor: &Tree| -> Result<(), Error> {
+            journal.reserve(current, successor, &prevout, transaction)?;
+            journal.permit(transaction)?;
+            Ok(())
+        };
     prepare_step_funded(
         contract,
         current,
