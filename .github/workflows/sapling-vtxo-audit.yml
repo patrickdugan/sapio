@@ -30,8 +30,10 @@ jobs:
         run: cargo fmt --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml --all -- --check
       - name: Test the independent recovery-entitlement checks
         run: cargo test --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml
-      - name: Syntax check pinned real-service recovery driver
-        run: bash -n contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
+      - name: Syntax check pinned real-service and TEE bootstrap scripts
+        run: |
+          bash -n contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
+          bash -n contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh
       - name: Test independent-wallet recovery evidence runner
         run: python3 -m unittest discover -s contrib/sapling-vtxo-entitlements/scripts -p 'test_*.py'
       - name: Lint the standalone verifier
