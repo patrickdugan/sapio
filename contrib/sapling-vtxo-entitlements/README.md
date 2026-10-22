@@ -236,6 +236,39 @@ Keep a separate service-stop log and fee-wallet funding record. They are
 not attested by either verifier.
 
 
+## Bitcoin Core wallet-only live regression
+
+The separate Bitcoin Core PSBT runner has a **live regtest smoke test**:
+
+```sh
+python3 contrib/sapling-vtxo-entitlements/scripts/live_core_wallet_smoke.py \
+  --bitcoind /absolute/path/to/bitcoind \
+  --bitcoin-cli /absolute/path/to/bitcoin-cli \
+  --output /private/regtest-wallet-smoke
+```
+
+It starts an isolated disposable Bitcoin Core node and three descriptor wallets
+(miner, Alice and Bob). The miner makes two ordinary Bitcoin payments of
+60,000 and 40,000 sats. Both payments confirm, and then the actual
+`prove_separate_spends.py` checks separate wallet spendability, signs one
+PSBT per holder, broadcasts both redemptions and mines their block.
+
+**This is a wallet-only smoke test.** Its report is explicitly tagged
+`BITCOIN_CORE_WALLET_SMOKE_ONLY` and
+`cryptographic_sapling_recovery_proven=false`. It uses synthetic
+SaplingOS-shaped claim metadata and never invokes native
+`ProgramRecoveryBundle::verify()`. Signed Ark ancestry and publication
+after service shutdown require the genuine fixture below.
+
+The [Bitcoin Core wallet-only CI workflow](../../.github/workflows/sapling-core-wallet-smoke.yml)
+downloads the official Bitcoin Core 30.3 x86_64 release and checks SHA-256
+`4753cd70416c629a2090503e8545a3c05e94a0f5037f8fb97b4c35c6e1afee0e`
+before executing. The same digest appears independently in the fanquake,
+achow101, Sjors and Emzy builder attestations in the pinned
+[Bitcoin Core 30.3 Guix evidence](https://github.com/bitcoin-core/guix.sigs/tree/d4a305fe827dbe88d4a5fa36f9b9f73d1249ab31/30.3).
+The workflow artifact is named to distinguish wallet-only results from real
+SaplingOS recovery evidence.
+
 ## Running the genuine two-holder service-shutdown fixture
 
 An opt-in integration test at
