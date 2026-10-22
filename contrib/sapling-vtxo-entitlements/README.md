@@ -425,6 +425,22 @@ single joint-output claim with two independently executable unilateral
 withdrawals is a further distinct property. The real integration requires external service
 binaries and has not been run by the lightweight dedicated CI.
 
+### Immutable export checks during the service outage
+
+The two real-service fixture paths additionally snapshot SHA-256 digests
+and byte counts for the independently agreed payout terms and each holder's
+signed recovery export **before** the cosigner and Ark services stop.
+After the offline publication and immediately before combining the
+bundles, the fixture recomputes those digests and fails on any changed
+byte. It repeats this check after the separate Bitcoin Core spends.
+
+This prevents the test from accepting a substituted or rolled-back saved
+export simply because a second cryptographically valid claim exists.
+The saved originals remain private, and only their digests are eligible
+for the sanitized proof receipt. This additional guard is staged on the
+`research/sapling-proof-freeze-qa-2026-10-23` branch pending promotion
+after the ongoing pinned full-service run completes.
+
 ## Verification boundaries
 
 A successful report means the existing SaplingOS cryptographic verifier
