@@ -119,38 +119,60 @@ fn payout_map(outputs: &[TxOut]) -> BTreeMap<(u64, Vec<u8>), usize> {
 /// Independently compare all exact payout amounts/scripts and the sole fee
 /// anchor. No unknown outputs, short payments or shared/duplicated recipient
 /// scripts are accepted. The P2A script is defined in BIP 433.
-pub fn verify_payouts(
-    actual: &[TxOut],
-    terms: &[Beneficiary],
-    principal: u64,
-) -> Result<()> {
-    ensure!(!terms.is_empty(), "recovery requires independently agreed beneficiaries");
+pub fn verify_payouts(actual: &[TxOut], terms: &[Beneficiary], principal: u64) -> Result<()> {
+    ensure!(
+        !terms.is_empty(),
+        "recovery requires independently agreed beneficiaries"
+    );
     let mut holders = HashSet::new();
     let mut scripts = HashSet::new();
     let mut planned_sum = 0u64;
     let mut outputs = Vec::with_capacity(terms.len() + 1);
     for term in terms {
-        ensure!(!term.holder.trim().is_empty(), "empty participant identifier");
-        ensure!(holders.insert(term.holder.clone()), "duplicate participant identifier");
+        ensure!(
+            !term.holder.trim().is_empty(),
+            "empty participant identifier"
+        );
+        ensure!(
+            holders.insert(term.holder.clone()),
+            "duplicate participant identifier"
+        );
         ensure!(term.sats > 0, "zero or negative beneficiary amount");
         let script = hex::decode(&term.script_pubkey_hex)
             .with_context(|| format!("invalid script hex for {}", term.holder))?;
-        ensure!(!script.is_empty() && script.len() <= 10_000, "invalid beneficiary script length");
-        ensure!(script != ANCHOR_SPK.to_vec(), "fee anchor cannot be a beneficiary");
+        ensure!(
+            !script.is_empty() && script.len() <= 10_000,
+            "invalid beneficiary script length"
+        );
+        ensure!(
+            script != ANCHOR_SPK.to_vec(),
+            "fee anchor cannot be a beneficiary"
+        );
         ensure!(script[0] != 0x6a, "OP_RETURN is not a beneficiary");
-        ensure!(scripts.insert(script.clone()), "two participants share one output script");
-        planned_sum = planned_sum.checked_add(term.sats).context("participant total overflows")?;
+        ensure!(
+            scripts.insert(script.clone()),
+            "two participants share one output script"
+        );
+        planned_sum = planned_sum
+            .checked_add(term.sats)
+            .context("participant total overflows")?;
         outputs.push(TxOut {
             value: bitcoin::Amount::from_sat(term.sats),
             script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
         });
     }
-    ensure!(planned_sum == principal, "beneficiary totals differ from backed VTXO principal");
+    ensure!(
+        planned_sum == principal,
+        "beneficiary totals differ from backed VTXO principal"
+    );
     outputs.push(TxOut {
         value: bitcoin::Amount::ZERO,
         script_pubkey: bitcoin::ScriptBuf::from_bytes(ANCHOR_SPK.to_vec()),
     });
-    ensure!(payout_map(actual) == payout_map(&outputs), "signed Bitcoin payout outputs differ from agreed terms");
+    ensure!(
+        payout_map(actual) == payout_map(&outputs),
+        "signed Bitcoin payout outputs differ from agreed terms"
+    );
     Ok(())
 }
 
@@ -175,8 +197,14 @@ struct BackingTrace {
 /// Two leaf claims may share ancestor transactions if the ancestor allocates
 /// them to distinct outputs, and their total cannot exceed common backing.
 fn verify_backing_traces(traces: &[BackingTrace]) -> Result<()> {
-    let selected = traces.iter().map(|trace| trace.controlled).collect::<HashSet<_>>();
-    ensure!(selected.len() == traces.len(), "duplicate canonical VTXO position");
+    let selected = traces
+        .iter()
+        .map(|trace| trace.controlled)
+        .collect::<HashSet<_>>();
+    ensure!(
+        selected.len() == traces.len(),
+        "duplicate canonical VTXO position"
+    );
 
     let mut already_spent = HashMap::<OutPoint, bitcoin::Txid>::new();
     let mut roots = HashMap::<OutPoint, (u64, Vec<u8>, u64)>::new();
@@ -193,14 +221,17 @@ fn verify_backing_traces(traces: &[BackingTrace]) -> Result<()> {
                 );
             }
         }
-        let entry = roots.entry(trace.anchor).or_insert_with(|| {
-            (trace.anchor_amount, trace.anchor_script.clone(), 0)
-        });
+        let entry = roots
+            .entry(trace.anchor)
+            .or_insert_with(|| (trace.anchor_amount, trace.anchor_script.clone(), 0));
         ensure!(
             entry.0 == trace.anchor_amount && entry.1 == trace.anchor_script,
             "one chain anchor has inconsistent Bitcoin backing data"
         );
-        entry.2 = entry.2.checked_add(trace.value).context("backing sum overflow")?;
+        entry.2 = entry
+            .2
+            .checked_add(trace.value)
+            .context("backing sum overflow")?;
         ensure!(
             entry.2 <= entry.0,
             "selected VTXO positions exceed their common chain anchor backing"
@@ -212,41 +243,67 @@ fn verify_backing_traces(traces: &[BackingTrace]) -> Result<()> {
 /// Validate signed saved SaplingOS claims, then compare actual outputs to a
 /// separately agreed allocation. This remains an *offline* report.
 pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<AuditReport> {
-    ensure!(terms.version == 1, "unsupported independent payout terms version");
+    ensure!(
+        terms.version == 1,
+        "unsupported independent payout terms version"
+    );
     let network = Network::from_str(&terms.network).context("unknown Bitcoin network")?;
-    ensure!(network == bundle.network, "independent plan uses a different network");
+    ensure!(
+        network == bundle.network,
+        "independent plan uses a different network"
+    );
 
     // SaplingOS verifies BIP340 signatures, native antecedents, script
     // commitments, program descriptors, exact configured payout templates
     // and exported recovery completeness constraints.
-    bundle.verify().context("SaplingOS cryptographic recovery verification failed")?;
+    bundle
+        .verify()
+        .context("SaplingOS cryptographic recovery verification failed")?;
 
     let mut targets = HashSet::new();
     for expected in &terms.targets {
         let outpoint = OutPoint::from_str(&expected.outpoint)
             .with_context(|| format!("invalid outpoint {}", expected.outpoint))?;
-        ensure!(targets.insert(outpoint), "duplicate target in independent terms");
+        ensure!(
+            targets.insert(outpoint),
+            "duplicate target in independent terms"
+        );
     }
-    ensure!(!targets.is_empty(), "no independently specified recovery positions");
+    ensure!(
+        !targets.is_empty(),
+        "no independently specified recovery positions"
+    );
     let exported = bundle.targets.iter().copied().collect::<HashSet<_>>();
-    ensure!(exported == targets, "exported targets differ from the independent plan");
+    ensure!(
+        exported == targets,
+        "exported targets differ from the independent plan"
+    );
 
     let mut reports = Vec::new();
     let mut traces = Vec::new();
     let mut total = 0u64;
     for expected in &terms.targets {
         let point = OutPoint::from_str(&expected.outpoint)?;
-        let record = bundle.recoveries.iter()
+        let record = bundle
+            .recoveries
+            .iter()
             .find(|record| record.controlled_outpoint == point)
             .context("bundle missing selected recovery record")?;
         // Cryptographically valid signatures from a self-selected program
         // remain meaningless until its exact evaluator/parameters and
         // signer root are independently pinned by the beneficiaries.
-        let descriptor = bundle.keys.iter()
+        let descriptor = bundle
+            .keys
+            .iter()
             .find(|key| key.program.public_key().ok() == Some(record.program_key))
             .context("missing signed program identity for recovery")?;
         ensure!(
-            descriptor.program.program.id().to_string().eq_ignore_ascii_case(&expected.program.program_id),
+            descriptor
+                .program
+                .program
+                .id()
+                .to_string()
+                .eq_ignore_ascii_case(&expected.program.program_id),
             "recovery program ID differs from the independently trusted identity"
         );
         ensure!(
@@ -254,28 +311,48 @@ pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<Aud
             "recovery signer root differs from independently attested xpub"
         );
         ensure!(
-            descriptor.program.user_pubkey.to_string().eq_ignore_ascii_case(&expected.program.user_pubkey),
+            descriptor
+                .program
+                .user_pubkey
+                .to_string()
+                .eq_ignore_ascii_case(&expected.program.user_pubkey),
             "recovery user public key differs from agreed owner"
         );
         match bundle.readiness(point)? {
             ProgramRecoveryReadiness::Complete => {}
-            ProgramRecoveryReadiness::Prepared => bail!("{} has incomplete prepared ancestors", point),
-            ProgramRecoveryReadiness::Conditional { .. } =>
-                bail!("{} has a conditional branch requiring additional publication", point),
+            ProgramRecoveryReadiness::Prepared => {
+                bail!("{} has incomplete prepared ancestors", point)
+            }
+            ProgramRecoveryReadiness::Conditional { .. } => bail!(
+                "{} has a conditional branch requiring additional publication",
+                point
+            ),
         };
         let amount = record.prevout.value.to_sat();
         verify_payouts(&record.claim.output, &expected.beneficiaries, amount)
             .with_context(|| format!("wrong beneficiary allocation for {point}"))?;
-        total = total.checked_add(amount).context("total backing overflows u64")?;
+        total = total
+            .checked_add(amount)
+            .context("total backing overflows u64")?;
         traces.push(BackingTrace {
             controlled: point,
             anchor: record.chain_anchor,
             anchor_amount: record.chain_anchor_prevout.value.to_sat(),
-            anchor_script: record.chain_anchor_prevout.script_pubkey.as_bytes().to_vec(),
+            anchor_script: record
+                .chain_anchor_prevout
+                .script_pubkey
+                .as_bytes()
+                .to_vec(),
             value: amount,
-            spends: record.ancestors.iter().flat_map(|tx| {
-                tx.input.iter().map(move |input| (input.previous_output, tx.compute_txid()))
-            }).collect(),
+            spends: record
+                .ancestors
+                .iter()
+                .flat_map(|tx| {
+                    tx.input
+                        .iter()
+                        .map(move |input| (input.previous_output, tx.compute_txid()))
+                })
+                .collect(),
         });
         reports.push(TargetReport {
             outpoint: point.to_string(),
@@ -328,7 +405,11 @@ mod tests {
         }
     }
     fn outputs() -> Vec<TxOut> {
-        vec![txout(60_000, script(1)), txout(40_000, script(2)), txout(0, ANCHOR_SPK.to_vec())]
+        vec![
+            txout(60_000, script(1)),
+            txout(40_000, script(2)),
+            txout(0, ANCHOR_SPK.to_vec()),
+        ]
     }
 
     #[test]
@@ -387,7 +468,10 @@ mod tests {
     }
 
     fn point(id: u8, vout: u32) -> OutPoint {
-        OutPoint::new(<bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([id; 32]), vout)
+        OutPoint::new(
+            <bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([id; 32]),
+            vout,
+        )
     }
     fn backing(id: u8, vout: u32, value: u64, spend: u8, root_value: u64) -> BackingTrace {
         BackingTrace {

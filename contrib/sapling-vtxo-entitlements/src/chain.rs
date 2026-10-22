@@ -15,10 +15,10 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
-use std::collections::HashSet;
 use sapling::sapio::recovery::ProgramRecoveryBundle;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
@@ -72,7 +72,10 @@ fn core_network(network: &str) -> Result<&'static str> {
 impl BitcoinCoreCli {
     /// Create a local-RPC client using an independently selected binary.
     pub fn new(binary: PathBuf, network: &str, datadir: Option<PathBuf>) -> Result<Self> {
-        ensure!(!binary.as_os_str().is_empty(), "bitcoin-cli binary path is empty");
+        ensure!(
+            !binary.as_os_str().is_empty(),
+            "bitcoin-cli binary path is empty"
+        );
         Ok(Self {
             binary,
             datadir,
@@ -117,11 +120,16 @@ impl ChainView for BitcoinCoreCli {
         let object = self
             .rpc("getrawtransaction", &[txid.to_string(), "true".into()])
             .context("getrawtransaction needs a synced node with transaction index")?;
-        let raw = object["hex"].as_str().context("node did not return transaction hex")?;
+        let raw = object["hex"]
+            .as_str()
+            .context("node did not return transaction hex")?;
         let bytes = hex::decode(raw).context("node supplied non-hex raw transaction")?;
         let transaction: Transaction = bitcoin::consensus::deserialize(&bytes)
             .context("cannot decode node's Bitcoin transaction")?;
-        ensure!(transaction.compute_txid() == txid, "node returned wrong transaction ID");
+        ensure!(
+            transaction.compute_txid() == txid,
+            "node returned wrong transaction ID"
+        );
         let depth = object["confirmations"]
             .as_u64()
             .context("claim is unconfirmed, conflicted or absent from active chain")?;
@@ -209,7 +217,10 @@ pub fn verify_confirmed_claim(
     controlled: OutPoint,
     min_confirmations: u64,
 ) -> Result<ConfirmedTarget> {
-    ensure!(min_confirmations > 0, "minimum confirmation depth must be positive");
+    ensure!(
+        min_confirmations > 0,
+        "minimum confirmation depth must be positive"
+    );
     let txid = claim.compute_txid();
     let onchain = view.transaction(txid)?;
     ensure!(
@@ -217,8 +228,7 @@ pub fn verify_confirmed_claim(
         "saved recovery claim has insufficient confirmations"
     );
     ensure!(
-        onchain.transaction.compute_txid() == txid &&
-        onchain.transaction.output == claim.output,
+        onchain.transaction.compute_txid() == txid && onchain.transaction.output == claim.output,
         "confirmed transaction differs from the signed recovery claim"
     );
     let mut payouts = Vec::new();
@@ -235,10 +245,15 @@ pub fn verify_confirmed_claim(
             scripts.insert(target_script.clone()),
             "shared beneficiary payout script"
         );
-        let matches = claim.output.iter().enumerate().filter(|(_, output)| {
-            output.value.to_sat() == recipient.sats &&
-            output.script_pubkey.as_bytes() == target_script.as_slice()
-        }).collect::<Vec<_>>();
+        let matches = claim
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| {
+                output.value.to_sat() == recipient.sats
+                    && output.script_pubkey.as_bytes() == target_script.as_slice()
+            })
+            .collect::<Vec<_>>();
         ensure!(
             matches.len() == 1,
             "beneficiary does not have one unambiguous signed payout"
@@ -272,7 +287,10 @@ pub fn audit_chain(
     minimum_confirmations: u64,
 ) -> Result<ChainReport> {
     audit_bundle(bundle, terms)?;
-    ensure!(minimum_confirmations > 0, "zero confirmations cannot prove an active-chain payout");
+    ensure!(
+        minimum_confirmations > 0,
+        "zero confirmations cannot prove an active-chain payout"
+    );
     let chain = view.chain()?;
     ensure!(
         chain == core_network(&terms.network)?,
@@ -280,12 +298,20 @@ pub fn audit_chain(
     );
     let mut targets = Vec::new();
     for expected in &terms.targets {
-        let point: OutPoint = expected.outpoint.parse().context("invalid selected outpoint")?;
-        let record = bundle.recoveries.iter()
+        let point: OutPoint = expected
+            .outpoint
+            .parse()
+            .context("invalid selected outpoint")?;
+        let record = bundle
+            .recoveries
+            .iter()
             .find(|item| item.controlled_outpoint == point)
             .context("missing previously verified recovery")?;
         targets.push(verify_confirmed_claim(
-            view, &record.claim, &expected.beneficiaries, point,
+            view,
+            &record.claim,
+            &expected.beneficiaries,
+            point,
             minimum_confirmations,
         )?);
     }
@@ -315,7 +341,9 @@ mod tests {
             Ok(self.network.clone())
         }
         fn transaction(&self, _txid: Txid) -> Result<ObservedTransaction> {
-            self.tx.clone().context("missing confirmed recovery transaction")
+            self.tx
+                .clone()
+                .context("missing confirmed recovery transaction")
         }
         fn unspent(&self, point: OutPoint, _script: &ScriptBuf) -> Result<bool> {
             Ok(self.unspent.contains(&point))
@@ -354,8 +382,14 @@ mod tests {
                 ..Default::default()
             }],
             output: vec![
-                TxOut { value: Amount::from_sat(60_000), script_pubkey: alice },
-                TxOut { value: Amount::from_sat(40_000), script_pubkey: bob },
+                TxOut {
+                    value: Amount::from_sat(60_000),
+                    script_pubkey: alice,
+                },
+                TxOut {
+                    value: Amount::from_sat(40_000),
+                    script_pubkey: bob,
+                },
             ],
         };
         (tx, recipients)
@@ -367,12 +401,14 @@ mod tests {
         let txid = claim.compute_txid();
         let view = FakeView {
             network: "regtest".into(),
-            tx: Some(ObservedTransaction { transaction: claim.clone(), confirmations: 8 }),
+            tx: Some(ObservedTransaction {
+                transaction: claim.clone(),
+                confirmations: 8,
+            }),
             unspent: [OutPoint::new(txid, 0)].into_iter().collect(),
         };
-        let result = verify_confirmed_claim(
-            &view, &claim, &recipients, OutPoint::null(), 6,
-        ).unwrap();
+        let result =
+            verify_confirmed_claim(&view, &claim, &recipients, OutPoint::null(), 6).unwrap();
         assert_eq!(result.confirmations, 8);
         assert!(result.payouts[0].unspent_at_tip);
         assert!(!result.payouts[1].unspent_at_tip);
@@ -383,16 +419,17 @@ mod tests {
         let (claim, recipients) = fixture();
         let view = FakeView {
             network: "regtest".into(),
-            tx: Some(ObservedTransaction { transaction: claim.clone(), confirmations: 2 }),
+            tx: Some(ObservedTransaction {
+                transaction: claim.clone(),
+                confirmations: 2,
+            }),
             unspent: HashSet::new(),
         };
-        assert!(verify_confirmed_claim(
-            &view, &claim, &recipients, OutPoint::null(), 6,
-        ).is_err());
+        assert!(verify_confirmed_claim(&view, &claim, &recipients, OutPoint::null(), 6,).is_err());
         let absent = FakeView { tx: None, ..view };
-        assert!(verify_confirmed_claim(
-            &absent, &claim, &recipients, OutPoint::null(), 1,
-        ).is_err());
+        assert!(
+            verify_confirmed_claim(&absent, &claim, &recipients, OutPoint::null(), 1,).is_err()
+        );
     }
 
     #[test]
@@ -402,12 +439,13 @@ mod tests {
         different.output[0].value += Amount::ONE_SAT;
         let view = FakeView {
             network: "regtest".into(),
-            tx: Some(ObservedTransaction { transaction: different, confirmations: 20 }),
+            tx: Some(ObservedTransaction {
+                transaction: different,
+                confirmations: 20,
+            }),
             unspent: HashSet::new(),
         };
-        assert!(verify_confirmed_claim(
-            &view, &claim, &recipients, OutPoint::null(), 6,
-        ).is_err());
+        assert!(verify_confirmed_claim(&view, &claim, &recipients, OutPoint::null(), 6,).is_err());
     }
 
     #[test]
@@ -417,12 +455,13 @@ mod tests {
         aliases.push(recipients[0].clone());
         let view = FakeView {
             network: "regtest".into(),
-            tx: Some(ObservedTransaction { transaction: claim.clone(), confirmations: 20 }),
+            tx: Some(ObservedTransaction {
+                transaction: claim.clone(),
+                confirmations: 20,
+            }),
             unspent: HashSet::new(),
         };
-        assert!(verify_confirmed_claim(
-            &view, &claim, &aliases, OutPoint::null(), 6,
-        ).is_err());
+        assert!(verify_confirmed_claim(&view, &claim, &aliases, OutPoint::null(), 6,).is_err());
     }
 
     #[test]

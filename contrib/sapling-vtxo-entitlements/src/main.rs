@@ -13,31 +13,42 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::PathBuf;
 
-fn value(args: &mut impl Iterator<Item=OsString>, flag: &str) -> Result<OsString> {
-    args.next().with_context(|| format!("missing value for {flag}"))
+fn value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString> {
+    args.next()
+        .with_context(|| format!("missing value for {flag}"))
 }
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
-    let bundle_path = args.next().context("missing SaplingOS recovery bundle path")?;
-    let terms_path = args.next().context("missing independently agreed payout terms path")?;
+    let bundle_path = args
+        .next()
+        .context("missing SaplingOS recovery bundle path")?;
+    let terms_path = args
+        .next()
+        .context("missing independently agreed payout terms path")?;
 
     let mut bitcoin_cli: Option<PathBuf> = None;
     let mut datadir: Option<PathBuf> = None;
     let mut confirmations: u64 = 6;
     while let Some(flag) = args.next() {
         match flag.to_str().context("CLI option must be UTF-8")? {
-            "--bitcoin-cli" => bitcoin_cli = Some(PathBuf::from(value(&mut args, "--bitcoin-cli")?)),
+            "--bitcoin-cli" => {
+                bitcoin_cli = Some(PathBuf::from(value(&mut args, "--bitcoin-cli")?))
+            }
             "--datadir" => datadir = Some(PathBuf::from(value(&mut args, "--datadir")?)),
             "--confirmations" => {
                 confirmations = value(&mut args, "--confirmations")?
-                    .to_str().context("invalid UTF-8 confirmation depth")?
-                    .parse().context("confirmation depth must be a positive integer")?;
+                    .to_str()
+                    .context("invalid UTF-8 confirmation depth")?
+                    .parse()
+                    .context("confirmation depth must be a positive integer")?;
                 if confirmations == 0 {
                     bail!("confirmation depth must be positive");
                 }
-            },
-            _ => bail!("unknown option; usage: sapling-vtxo-entitlements BUNDLE.json TERMS.json [--bitcoin-cli PATH] [--datadir PATH] [--confirmations N]"),
+            }
+            _ => bail!(
+                "unknown option; usage: sapling-vtxo-entitlements BUNDLE.json TERMS.json [--bitcoin-cli PATH] [--datadir PATH] [--confirmations N]"
+            ),
         }
     }
 
@@ -51,9 +62,12 @@ fn main() -> Result<()> {
     if let Some(binary) = bitcoin_cli {
         let node = BitcoinCoreCli::new(binary, &terms.network, datadir)?;
         let onchain = audit_chain(&bundle, &terms, &node, confirmations)?;
-        println!("{}", serde_json::to_string_pretty(
-            &serde_json::json!({"offline": offline, "chain": onchain})
-        )?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"offline": offline, "chain": onchain})
+            )?
+        );
     } else {
         ensure_offline_options(datadir)?;
         println!("{}", serde_json::to_string_pretty(&offline)?);
