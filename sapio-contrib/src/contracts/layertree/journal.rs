@@ -831,8 +831,8 @@ mod tests {
         candidate.input[0].witness = bitcoin::Witness::from_slice(&[vec![1u8; 64]]);
         journal.checkpoint_witnessed(&candidate).unwrap();
         let mut tampered = serde_json::to_value(journal).unwrap();
-        tampered["pending"]["witnessed"]["transaction"]["input"][0]["witness"] =
-            serde_json::Value::Null;
+        tampered["pending"]["witnessed"]["wtxid"] =
+            serde_json::Value::String(bitcoin::Wtxid::from_byte_array([5; 32]).to_string());
         let path = std::env::temp_dir().join(format!(
             "sapio-damaged-witness-{}-{}.json",
             std::process::id(),
