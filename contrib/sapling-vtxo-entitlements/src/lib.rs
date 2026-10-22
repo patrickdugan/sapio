@@ -11,6 +11,8 @@
 //! underlying Ark expiry nor overlapping backing across different VTXOs is
 //! established by this offline report.
 
+pub mod chain;
+
 use anyhow::{Context, Result, bail, ensure};
 use bitcoin::{Network, OutPoint, TxOut};
 use sapling::sapio::recovery::{ProgramRecoveryBundle, ProgramRecoveryReadiness};

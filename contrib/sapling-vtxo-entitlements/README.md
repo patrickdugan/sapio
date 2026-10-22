@@ -20,6 +20,30 @@ cargo run --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
   /private/sapling-recovery-bundle.json /private/agreed-payouts.json
 ```
 
+After the prepared recovery transaction is **actually confirmed**, you can
+run an optional second stage against a trusted Bitcoin Core node:
+
+```sh
+cargo run --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
+  /private/sapling-recovery-bundle.json /private/agreed-payouts.json \
+  --bitcoin-cli /trusted/path/to/bitcoin-cli --datadir /private/bitcoin \
+  --confirmations 6
+```
+
+The local Bitcoin Core node should have completed initial sync and have
+`txindex=1` enabled. The observer uses `getblockchaininfo`,
+`getrawtransaction` and `gettxout` directly, with no shell interpolation.
+It requires the **exact signed recovery transaction** to have reached the
+requested confirmation depth on the expected network. For each participant,
+it reports whether the confirmed payout outpoint remains in the UTXO set.
+A spent output may already have been redeemed legitimately, and the tool
+cannot identify the spending party. No unconfirmed or hypothetical recoveries
+are treated as confirmed. The response is a JSON object with `offline`
+and `chain` sections when Bitcoin Core mode is enabled.
+
+This observes post-recovery Bitcoin finality. It does not proactively resolve
+an unpublished Ark branch or predict whether a pending recovery can confirm.
+
 The SDK's exported bundle can be obtained through
 `wallet.program_recovery_bundle(&[])`. Preserve and protect that bundle;
 its evidence and contract parameters can reveal private information.
@@ -96,20 +120,24 @@ match the independent plan. It **does not** mean:
 * the signer was honestly measured, KMS policies were historically immutable,
   or the exported bundle was preserved before a crash.
 
-The JSON report includes `script_spendability_checked: false` and
-`chain_availability_checked: false` for that reason, plus
-`selected_paths_nonconflicting: true` when the cross-target checks pass. For a serious shared
+The offline JSON report includes `script_spendability_checked: false` and
+`chain_availability_checked: false`, plus
+`selected_paths_nonconflicting: true` when the cross-target checks pass.
+The separate optional chain report requires a confirmed transaction and
+still records `beneficiary_key_custody_checked: false`. For a serious shared
 VTXO, the next integration must check the script's actual required keys,
 observe competing spend branches using Bitcoin Core regtest, and verify that
 each target references uniquely accounted-for backing.
 
 ## Test coverage
 
-Ten pure tests exercise correct 60,000/40,000 outputs, a one-satoshi
+Fifteen pure tests exercise correct 60,000/40,000 outputs, a one-satoshi
 redistribution, output redirection, invalid or duplicated beneficiary IDs,
 shared script aliases, missing/unknown fee outputs, shared ancestor sibling
 paths, conflicting ancestor spends, parent-child counting and common-root
-principal conservation. These tests use
+principal conservation. Additional chain-observer tests cover exact
+confirmed payouts, live UTXO flags, insufficient confirmations, mismatched
+transaction data and duplicate recipient names. These tests use
 **synthetic TxOuts**, since no signed exported SaplingOS bundle was included
 in the upstream repo snapshot. The executable path invokes the *real*
 SaplingOS verifier for actual bundle inputs. A successful signed-bundle
