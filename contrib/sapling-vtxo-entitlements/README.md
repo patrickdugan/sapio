@@ -1,5 +1,10 @@
 # Offline SaplingOS recovery-entitlement auditor
 
+This workspace commits a complete Cargo.lock, currently pinning **343 package
+entries** including every registry checksum and the exact SaplingOS Git
+revision. Use `--locked` for builds and tests; update the lockfile only in
+reviewed dependency-update commits.
+
 This is a small **separate Rust workspace** inside the Sapio fork. It links
 the [SaplingOS SDK](https://github.com/stutxo/saplingos) at
 `b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d`. It does not patch SaplingOS,
@@ -15,8 +20,8 @@ to match it exactly.
 ## Running
 
 ```sh
-cargo test --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml
-cargo run --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
+cargo test --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml
+cargo run --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
   /private/sapling-recovery-bundle.json /private/agreed-payouts.json
 ```
 
@@ -24,7 +29,7 @@ After the prepared recovery transaction is **actually confirmed**, you can
 run an optional second stage against a trusted Bitcoin Core node:
 
 ```sh
-cargo run --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
+cargo run --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
   /private/sapling-recovery-bundle.json /private/agreed-payouts.json \
   --bitcoin-cli /trusted/path/to/bitcoin-cli --datadir /private/bitcoin \
   --confirmations 6
