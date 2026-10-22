@@ -257,8 +257,10 @@ async fn sapio_real_two_holder_offline_recovery() {
     let tee = SapioTee::launch(&ctx).await;
     let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
         .funded(btc(1)).create().await;
+    let sponsor_seed = bip39::Mnemonic::generate(12).unwrap();
     let fee_wallet = ctx.sdk("external-recovery-fees", &srv)
-        .funded(sat(800_000)).cfg(|c| c.daemon_manual_sync = true).create().await;
+        .mnemonic(sponsor_seed.clone()).funded(sat(800_000))
+        .cfg(|c| c.daemon_manual_sync = true).create().await;
     assert!(fee_wallet.spendable_vtxos().await.unwrap().is_empty(),
         "recovery sponsor must have no Ark VTXOs");
     let sponsor_coins = capture_fee_wallet_funding(&fee_wallet).await;
@@ -273,6 +275,8 @@ async fn sapio_real_two_holder_offline_recovery() {
     let alice_seed = bip39::Mnemonic::generate(12).unwrap();
     let bob_seed = bip39::Mnemonic::generate(12).unwrap();
     assert_ne!(alice_seed.to_string(), bob_seed.to_string());
+    assert_ne!(sponsor_seed.to_string(), alice_seed.to_string());
+    assert_ne!(sponsor_seed.to_string(), bob_seed.to_string());
 
     // Two genuine SaplingOS program-controlled VTXOs, created by live
     // signatures and actual Bitcoin boarding, have 60k/40k principal.
@@ -477,8 +481,10 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let tee = SapioTee::launch(&ctx).await;
     let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
         .funded(btc(1)).create().await;
+    let sponsor_seed = bip39::Mnemonic::generate(12).unwrap();
     let fee_wallet = ctx.sdk("external-recovery-fees", &srv)
-        .funded(sat(800_000)).cfg(|c| c.daemon_manual_sync = true).create().await;
+        .mnemonic(sponsor_seed.clone()).funded(sat(800_000))
+        .cfg(|c| c.daemon_manual_sync = true).create().await;
     assert!(fee_wallet.spendable_vtxos().await.unwrap().is_empty(),
         "recovery sponsor must have no Ark VTXOs");
     let sponsor_coins = capture_fee_wallet_funding(&fee_wallet).await;
@@ -502,6 +508,8 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let seed_a = bip39::Mnemonic::generate(12).unwrap();
     let seed_b = bip39::Mnemonic::generate(12).unwrap();
     assert_ne!(seed_a.to_string(), seed_b.to_string());
+    assert_ne!(sponsor_seed.to_string(), seed_a.to_string());
+    assert_ne!(sponsor_seed.to_string(), seed_b.to_string());
 
     let (alice_socket, alice_url) = listener().await;
     let (bob_socket, bob_url) = listener().await;
