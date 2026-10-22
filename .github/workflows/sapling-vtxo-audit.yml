@@ -1,0 +1,41 @@
+name: SaplingOS recovery-entitlement audit
+
+on:
+  pull_request:
+    paths:
+      - "contrib/sapling-vtxo-entitlements/**"
+      - ".github/workflows/sapling-vtxo-audit.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  offline-auditor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned Sapio toolchain
+        run: rustup show
+      - name: Install SaplingOS protocol compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Check source formatting
+        run: cargo fmt --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml --all -- --check
+      - name: Test the independent recovery-entitlement checks
+        run: cargo test --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml
+      - name: Syntax check pinned real-service and TEE bootstrap scripts
+        run: |
+          bash -n contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
+          bash -n contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh
+          bash -n contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh
+      - name: Test independent-wallet recovery evidence runner
+        run: python3 -m unittest discover -s contrib/sapling-vtxo-entitlements/scripts -p 'test_*.py'
+      - name: Lint the standalone verifier
+        run: cargo clippy --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml --all-targets -- -D warnings

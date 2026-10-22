@@ -1,0 +1,56 @@
+name: Bitcoin Core wallet-only regtest smoke
+
+# Real Bitcoin payments and independent PSBT redemption.
+# A passing result does not prove SaplingOS recovery or Ark ancestry.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sapling-core-wallet-smoke.yml"
+      - "contrib/sapling-vtxo-entitlements/scripts/live_core_wallet_smoke.py"
+      - "contrib/sapling-vtxo-entitlements/scripts/prove_separate_spends.py"
+      - "contrib/sapling-vtxo-entitlements/scripts/test_prove_separate_spends.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bitcoin-core-wallet-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Obtain pinned, independently attested Bitcoin Core 30.3
+        env:
+          EXPECTED_SHA256: 4753cd70416c629a2090503e8545a3c05e94a0f5037f8fb97b4c35c6e1afee0e
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bitcoin-core"
+          cd "$RUNNER_TEMP/bitcoin-core"
+          curl --proto '=https' --tlsv1.2 -fsSLo bitcoin-30.3-x86_64-linux-gnu.tar.gz \
+            https://bitcoincore.org/bin/bitcoin-core-30.3/bitcoin-30.3-x86_64-linux-gnu.tar.gz
+          printf '%s  %s\n' "$EXPECTED_SHA256" bitcoin-30.3-x86_64-linux-gnu.tar.gz | sha256sum --check
+          tar -xzf bitcoin-30.3-x86_64-linux-gnu.tar.gz
+          test -x bitcoin-30.3/bin/bitcoind
+          test -x bitcoin-30.3/bin/bitcoin-cli
+          bitcoin-30.3/bin/bitcoind --version
+
+      - name: Run actual Bitcoin Core UTXO and two-wallet PSBT spend test
+        run: |
+          set -euo pipefail
+          python3 contrib/sapling-vtxo-entitlements/scripts/live_core_wallet_smoke.py \
+            --bitcoind "$RUNNER_TEMP/bitcoin-core/bitcoin-30.3/bin/bitcoind" \
+            --bitcoin-cli "$RUNNER_TEMP/bitcoin-core/bitcoin-30.3/bin/bitcoin-cli" \
+            --output "$GITHUB_WORKSPACE/wallet-smoke-evidence"
+          python3 -m unittest discover \
+            -s contrib/sapling-vtxo-entitlements/scripts -p 'test_*.py'
+
+      - name: Preserve explicitly synthetic-only Bitcoin Core evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitcoin-core-wallet-only-not-sapling-recovery
+          path: wallet-smoke-evidence/
+          if-no-files-found: error
+          retention-days: 3

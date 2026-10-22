@@ -1,0 +1,21 @@
+[package]
+name = "sapling-vtxo-entitlements"
+default-run = "sapling-vtxo-entitlements"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Offline independent payout verification of SaplingOS signed recovery bundles"
+
+# Separate workspace: this experiment reads a pinned SaplingOS SDK and is
+# isolated from Sapio's covenant workspace and its Cargo.lock.
+[workspace]
+resolver = "2"
+
+[dependencies]
+sapling-sdk = { git = "https://github.com/stutxo/saplingos", rev = "b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d", default-features = false, features = ["native"] }
+bitcoin = { version = "0.32.7", features = ["serde"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
