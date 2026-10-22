@@ -1,0 +1,143 @@
+name: SaplingOS genuine common-root recovery on disposable regtest
+
+# Heavy opt-in-by-PR experiment: builds pinned Ark, TEE and CLN services,
+# then destroys both Ark and Sapio signers before publishing recovered claims.
+# All wallets, keys and coins are generated for a new disposable regtest.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sapling-real-common-root.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sapling-real-common-root-pr2
+  cancel-in-progress: true
+
+jobs:
+  actual-service-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 135
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Recover build space before two pinned Rust service builds
+        run: |
+          set -euo pipefail
+          sudo apt-get clean
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/julia* \
+            2>/dev/null || true
+          df -h /
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Install native Bark, Bitcoin, CLN and PostgreSQL build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ca-certificates curl jq python3 pkg-config clang libclang-dev \
+            libssl-dev libsqlite3-dev libpq-dev protobuf-compiler cmake \
+            libboost-all-dev postgresql-16 postgresql-client-16 wabt
+          df -h /
+
+      - name: Compile pinned service binaries and exercise real regtest recovery
+        run: |
+          set -euo pipefail
+          export XDG_CACHE_HOME="$RUNNER_TEMP/sapling-recovery-cache"
+          export SAPLING_TEE_SOURCE_DIR="$XDG_CACHE_HOME/sapio_tee-f083bdbd2343aad22fab861f1565c0f2c2e6b0af"
+          export SAPLING_FIXTURE_TOOLS_DIR="$XDG_CACHE_HOME/fixture-tools"
+          export SAPLING_TWO_HOLDER_CAPTURE_DIR="$RUNNER_TEMP/signed-regtest-recovery"
+
+          bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh --build-only \
+            | tee "$RUNNER_TEMP/tee-exports.log"
+          source <(grep '^export ' "$RUNNER_TEMP/tee-exports.log")
+
+          bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh \
+            | tee "$RUNNER_TEMP/service-exports.log"
+          source <(grep '^export ' "$RUNNER_TEMP/service-exports.log")
+
+          # The pinned SaplingOS e2e suite starts fresh test instances itself.
+          # The external wallets and signers are stopped before recovery replay.
+          bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
+            sapio_real_common_anchor_two_holder_recovery
+          test -s "$SAPLING_TWO_HOLDER_CAPTURE_DIR/two-holder-pre-spend-report.json"
+          test -s "$SAPLING_TWO_HOLDER_CAPTURE_DIR/two-holder-redemptions.json"
+
+          python3 - "$SAPLING_TWO_HOLDER_CAPTURE_DIR" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[1])
+          def load(name):
+              return json.loads((root / name).read_text())
+          signed = load("frozen-evidence-before-shutdown.json")
+          fees = load("confirmed-p2a-fee-children.json")
+          audit = load("two-holder-pre-spend-report.json")
+          redeemed = load("two-holder-redemptions.json")
+          assert fees["real_common_root"] is True
+          assert fees["services_offline_when_fee_children_mined"] is True
+          assert fees["external_fee_wallet_keys_distinct_from_holders"] is True
+          assert audit["offline"]["total_protected_sats"] == 100_000
+          assert audit["offline"]["selected_paths_nonconflicting"] is True
+          assert audit["two_holder"]["total_payout_sats"] == 100_000
+          assert redeemed["independent_spends_confirmed"] is True
+          assert {p["holder"] for p in redeemed["redemptions"]} == {"alice", "bob"}
+          manifest_files = signed["files"]
+          assert {f["file"] for f in manifest_files} == {
+              "two-holder-terms.json", "alice-recovery.json", "bob-recovery.json"}
+          # Publish only public regtest txids and SHA-256s. Never upload the
+          # original signed bundles, wallet seeds, RPC secrets or service logs.
+          output = {
+              "proof_kind": "actual-pinned-saplingos-common-root-regtest",
+              "sdk_revision": "b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d",
+              "tee_revision": "f083bdbd2343aad22fab861f1565c0f2c2e6b0af",
+              "bark_revision": "626c9b241dd25d73212915d8fca959ab5e3b8f1f",
+              "common_root": fees["shared_chain_anchor"],
+              "separate_service_free_recovery": True,
+              "holder_claims": [
+                  {
+                      "holder": h["holder"],
+                      "claim_txid": h["confirmed_claim_txid"],
+                      "claim_wtxid": h["confirmed_claim_wtxid"],
+                      "payout_outpoint": h["payout_outpoint"],
+                      "sats": h["sats"]
+                  } for h in audit["two_holder"]["holders"]
+              ],
+              "recovery_fee_children": {
+                  holder: {
+                      "txid": fees[holder]["fee_child_txid"],
+                      "wtxid": fees[holder]["fee_child_wtxid"],
+                      "funded_fee_sats": fees[holder]["external_fee_sats"]
+                  } for holder in ("alice", "bob")
+              },
+              "independent_redemptions": [
+                  {"holder": p["holder"], "txid": p["txid"],
+                   "paid_sats": p["paid_sats"], "fee_sats": p["fee_sats"]}
+                  for p in redeemed["redemptions"]
+              ],
+              "pre_shutdown_export_hashes": manifest_files,
+          }
+          Path("public-regtest-proof.json").write_text(
+              json.dumps(output, sort_keys=True, indent=2) + "\n"
+          )
+          print("Genuine two-holder regtest evidence validated.")
+          PY
+
+      - name: Preserve only non-secret regtest proof receipt
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saplingos-real-common-root-regtest-proof
+          path: public-regtest-proof.json
+          if-no-files-found: error
+          retention-days: 3
