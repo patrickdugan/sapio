@@ -67,7 +67,15 @@ exactly one **zero-valued P2A fee anchor** (`51024e73`, BIP 433) and rejects
 other outputs or beneficiary-script collisions. Output order is arbitrary;
 the signed transaction has already committed to the actual order.
 
-The selected outpoints must match `bundle.targets` exactly. An unsigned
+The selected outpoints must match `bundle.targets` exactly. The auditor
+also checks the **recovery paths across selected positions**: a shared
+ancestor can split into independently funded sibling outputs, while competing
+transactions spending the same ancestor and parent-plus-child double counting
+are rejected. Their cumulative claims cannot exceed a common anchor's value.
+These are necessary structural checks rather than a complete proof that all
+external positions have disjoint economic backing.
+
+An unsigned
 ancestor or `Conditional` recovery is rejected because it may require an
 additional service publication. A mismatched output script, a 1-sat
 misallocation, additional recipient, or missing anchor fails the audit.
@@ -89,16 +97,19 @@ match the independent plan. It **does not** mean:
   or the exported bundle was preserved before a crash.
 
 The JSON report includes `script_spendability_checked: false` and
-`chain_availability_checked: false` for that reason. For a serious shared
+`chain_availability_checked: false` for that reason, plus
+`selected_paths_nonconflicting: true` when the cross-target checks pass. For a serious shared
 VTXO, the next integration must check the script's actual required keys,
 observe competing spend branches using Bitcoin Core regtest, and verify that
 each target references uniquely accounted-for backing.
 
 ## Test coverage
 
-Six pure tests exercise correct 60,000/40,000 outputs, a one-satoshi
+Ten pure tests exercise correct 60,000/40,000 outputs, a one-satoshi
 redistribution, output redirection, invalid or duplicated beneficiary IDs,
-shared script aliases, and missing/unknown fee outputs. These tests use
+shared script aliases, missing/unknown fee outputs, shared ancestor sibling
+paths, conflicting ancestor spends, parent-child counting and common-root
+principal conservation. These tests use
 **synthetic TxOuts**, since no signed exported SaplingOS bundle was included
 in the upstream repo snapshot. The executable path invokes the *real*
 SaplingOS verifier for actual bundle inputs. A successful signed-bundle

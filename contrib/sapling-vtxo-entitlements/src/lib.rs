@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use bitcoin::{Network, OutPoint, TxOut};
 use sapling::sapio::recovery::{ProgramRecoveryBundle, ProgramRecoveryReadiness};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 const ANCHOR_SPK: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
@@ -98,6 +98,8 @@ pub struct AuditReport {
     pub script_spendability_checked: bool,
     /// Makes the on-chain availability scope explicit to downstream consumers.
     pub chain_availability_checked: bool,
+    /// Necessary cross-target lineage checks only, not a complete backing proof.
+    pub selected_paths_nonconflicting: bool,
 }
 
 fn payout_map(outputs: &[TxOut]) -> BTreeMap<(u64, Vec<u8>), usize> {
@@ -150,6 +152,61 @@ pub fn verify_payouts(
     Ok(())
 }
 
+// A compact structural view of a signed recovery path. SaplingOS's own
+// verifier first checks the authentic Bitcoin transactions and ancestors.
+// These traces then rule out double counting across the selected records.
+#[derive(Clone, Debug)]
+struct BackingTrace {
+    controlled: OutPoint,
+    anchor: OutPoint,
+    anchor_amount: u64,
+    anchor_script: Vec<u8>,
+    value: u64,
+    // One ancestor transaction per spent input. Identical shared ancestors
+    // are allowed, as are different child vouts of the same ancestor txid.
+    spends: Vec<(OutPoint, bitcoin::Txid)>,
+}
+
+/// Necessary cross-target backing checks for simultaneously selected claims.
+///
+/// Different branches spending the same parent outpoint cannot both be live.
+/// Two leaf claims may share ancestor transactions if the ancestor allocates
+/// them to distinct outputs, and their total cannot exceed common backing.
+fn verify_backing_traces(traces: &[BackingTrace]) -> Result<()> {
+    let selected = traces.iter().map(|trace| trace.controlled).collect::<HashSet<_>>();
+    ensure!(selected.len() == traces.len(), "duplicate canonical VTXO position");
+
+    let mut already_spent = HashMap::<OutPoint, bitcoin::Txid>::new();
+    let mut roots = HashMap::<OutPoint, (u64, Vec<u8>, u64)>::new();
+    for trace in traces {
+        for (input, txid) in &trace.spends {
+            ensure!(
+                !selected.contains(input),
+                "one selected VTXO is an ancestor of another selected claim"
+            );
+            if let Some(earlier) = already_spent.insert(*input, *txid) {
+                ensure!(
+                    earlier == *txid,
+                    "selected recoveries use conflicting Bitcoin spends of one ancestor"
+                );
+            }
+        }
+        let entry = roots.entry(trace.anchor).or_insert_with(|| {
+            (trace.anchor_amount, trace.anchor_script.clone(), 0)
+        });
+        ensure!(
+            entry.0 == trace.anchor_amount && entry.1 == trace.anchor_script,
+            "one chain anchor has inconsistent Bitcoin backing data"
+        );
+        entry.2 = entry.2.checked_add(trace.value).context("backing sum overflow")?;
+        ensure!(
+            entry.2 <= entry.0,
+            "selected VTXO positions exceed their common chain anchor backing"
+        );
+    }
+    Ok(())
+}
+
 /// Validate signed saved SaplingOS claims, then compare actual outputs to a
 /// separately agreed allocation. This remains an *offline* report.
 pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<AuditReport> {
@@ -173,6 +230,7 @@ pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<Aud
     ensure!(exported == targets, "exported targets differ from the independent plan");
 
     let mut reports = Vec::new();
+    let mut traces = Vec::new();
     let mut total = 0u64;
     for expected in &terms.targets {
         let point = OutPoint::from_str(&expected.outpoint)?;
@@ -207,6 +265,16 @@ pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<Aud
         verify_payouts(&record.claim.output, &expected.beneficiaries, amount)
             .with_context(|| format!("wrong beneficiary allocation for {point}"))?;
         total = total.checked_add(amount).context("total backing overflows u64")?;
+        traces.push(BackingTrace {
+            controlled: point,
+            anchor: record.chain_anchor,
+            anchor_amount: record.chain_anchor_prevout.value.to_sat(),
+            anchor_script: record.chain_anchor_prevout.script_pubkey.as_bytes().to_vec(),
+            value: amount,
+            spends: record.ancestors.iter().flat_map(|tx| {
+                tx.input.iter().map(move |input| (input.previous_output, tx.compute_txid()))
+            }).collect(),
+        });
         reports.push(TargetReport {
             outpoint: point.to_string(),
             claim_txid: record.claim.compute_txid().to_string(),
@@ -215,12 +283,15 @@ pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<Aud
             readiness: "Complete",
         });
     }
+    verify_backing_traces(&traces)
+        .context("selected recovery positions do not have disjoint backing")?;
     Ok(AuditReport {
         network: terms.network.clone(),
         targets: reports,
         total_protected_sats: total,
         script_spendability_checked: false,
         chain_availability_checked: false,
+        selected_paths_nonconflicting: true,
     })
 }
 
@@ -312,4 +383,52 @@ mod tests {
         bad[0].script_pubkey = ScriptBuf::from_bytes(script(3));
         assert!(verify_payouts(&bad, &beneficiaries(), 100_000).is_err());
     }
+
+    fn point(id: u8, vout: u32) -> OutPoint {
+        OutPoint::new(<bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([id; 32]), vout)
+    }
+    fn backing(id: u8, vout: u32, value: u64, spend: u8, root_value: u64) -> BackingTrace {
+        BackingTrace {
+            controlled: point(id, vout),
+            anchor: point(1, 0),
+            anchor_amount: root_value,
+            anchor_script: script(42),
+            value,
+            spends: vec![(point(1, 0), point(spend, 0).txid)],
+        }
+    }
+
+    #[test]
+    fn sibling_claims_can_share_a_transaction_without_double_counting() {
+        let alice = backing(2, 0, 60_000, 2, 100_000);
+        let bob = backing(2, 1, 40_000, 2, 100_000);
+        verify_backing_traces(&[alice, bob]).unwrap();
+    }
+
+    #[test]
+    fn conflicting_ancestor_transactions_cannot_both_back_selected_claims() {
+        let alice = backing(2, 0, 60_000, 2, 100_000);
+        let bob = backing(3, 0, 40_000, 3, 100_000);
+        assert!(verify_backing_traces(&[alice, bob]).is_err());
+    }
+
+    #[test]
+    fn selected_parent_and_descendant_cannot_be_counted_together() {
+        let alice = backing(2, 0, 60_000, 2, 100_000);
+        let mut descendant = backing(3, 0, 40_000, 2, 100_000);
+        descendant.spends.push((point(2, 0), point(3, 0).txid));
+        assert!(verify_backing_traces(&[alice, descendant]).is_err());
+    }
+
+    #[test]
+    fn common_anchor_caps_child_principal_and_commits_to_one_root() {
+        let alice = backing(2, 0, 60_000, 2, 100_000);
+        let bob = backing(2, 1, 50_000, 2, 100_000);
+        assert!(verify_backing_traces(&[alice.clone(), bob.clone()]).is_err());
+        let mut substituted = bob;
+        substituted.value = 40_000;
+        substituted.anchor_script = script(43);
+        assert!(verify_backing_traces(&[alice, substituted]).is_err());
+    }
+}
 }
