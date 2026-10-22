@@ -656,6 +656,11 @@ fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
 
     let mut wallet = LockedLineage::open(&path).unwrap();
     assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    let (saved_before, saved_successor, saved_unsigned) =
+        wallet.state().saved_pending().unwrap().unwrap();
+    assert_eq!(saved_before.root(), tree.root());
+    assert_eq!(saved_successor.root(), first.next.root());
+    assert_eq!(saved_unsigned.compute_txid(), first_tx.compute_txid());
     assert!(example::prepare_step_reserved(
         &contract,
         &tree,
@@ -670,29 +675,25 @@ fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
     .is_err());
     // A real coordinator must check the confirmed txid with Bitcoin Core.
     // We model that authenticated notification here.
-    wallet
-        .confirm(first_tx.compute_txid(), &tree, &first.next)
-        .unwrap();
+    wallet.confirm_saved(first_tx.compute_txid()).unwrap();
 
     let second_coin = successor(&first_tx);
     let second = example::prepare_step_reserved(
         &contract,
-        &first.next,
+        &saved_successor,
         second_coin,
         Transition::Exit { count: 1 },
         vec![example::payout(&bob)],
         0,
         99,
         &mut wallet,
-        |sign, m| witness::exit(&first.next, &[(1, false, sign(&example::key(211)))], m),
+        |sign, m| witness::exit(&saved_successor, &[(1, false, sign(&example::key(211)))], m),
     )
     .unwrap();
     let second_tx = example::finish(&second, &example::oracle().unwrap()).unwrap();
     assert_eq!(wallet.permit(&second_tx).unwrap(), second_tx.compute_txid());
     assert_eq!(second_tx.output[1], example::payout(&bob));
-    wallet
-        .confirm(second_tx.compute_txid(), &first.next, &second.next)
-        .unwrap();
+    wallet.confirm_saved(second_tx.compute_txid()).unwrap();
     assert_eq!(wallet.state().root(), Node::empty(2));
     assert!(wallet.state().pending().is_none());
     drop(wallet);
@@ -751,6 +752,11 @@ fn signing_failure_after_fsync_leaves_a_sticky_reservation() {
     let recovered = LockedLineage::open(&path).unwrap();
     assert_eq!(recovered.state().pending(), Some(&pending));
     assert_eq!(recovered.state().root(), tree.root());
+    let (saved_before, saved_next, unsigned) =
+        recovered.state().saved_pending().unwrap().unwrap();
+    assert_eq!(saved_before.root(), tree.root());
+    assert_eq!(saved_next.root(), pending.after);
+    assert_eq!(unsigned.compute_txid(), pending.txid);
     drop(recovered);
     std::fs::remove_file(&path).unwrap();
     let mut lock = path.as_os_str().to_os_string();
