@@ -431,4 +431,3 @@ mod tests {
         assert!(verify_backing_traces(&[alice, substituted]).is_err());
     }
 }
-}
