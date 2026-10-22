@@ -79,6 +79,8 @@ pub struct TargetReport {
     pub outpoint: String,
     /// Signed terminal recovery transaction ID.
     pub claim_txid: String,
+    /// Witness transaction ID of the exact saved signed terminal recovery.
+    pub claim_wtxid: String,
     /// Total amount, excluding the zero-valued P2A anchor.
     pub protected_sats: u64,
     /// Number of distinct expected beneficiary scripts.
@@ -358,6 +360,7 @@ pub fn audit_bundle(bundle: &ProgramRecoveryBundle, terms: &Terms) -> Result<Aud
         reports.push(TargetReport {
             outpoint: point.to_string(),
             claim_txid: record.claim.compute_txid().to_string(),
+            claim_wtxid: record.claim.compute_wtxid().to_string(),
             protected_sats: amount,
             beneficiaries: expected.beneficiaries.len(),
             readiness: "Complete",
