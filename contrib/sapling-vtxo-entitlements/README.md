@@ -190,8 +190,9 @@ retained separately. The two claimant wallets must import their own keys
 and recognize the agreed scripts before the signing services are shut down.
 Run this against an **isolated disposable regtest node only**. The
 `--broadcast` step really spends the recovered outputs and therefore
-invalidates a later two-holder **unspent** report. Re-run the script against
-the saved pre-spend report for the signed-spend evidence.
+invalidates a later two-holder **unspent** report. Retain the
+runner's JSON signed-spend receipts and the pre-spend audit as separate
+pieces of evidence; the read-only preflight will reject spent payouts.
 
 These tests do not manufacture a valid SaplingOS export. Capture the actual
 `wallet.program_recovery_bundle(&[])` result while the program signer is
