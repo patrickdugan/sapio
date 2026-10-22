@@ -68,38 +68,47 @@ fn assert_saved_claim(
     assert!(confirmation.confirmations.unwrap_or(0) > 0);
 }
 
-fn spend_one_recipient(
-    ctx: &TestContext,
-    wallet: &Client,
-    bundle: &ProgramRecoveryBundle,
-    expected_amount: Amount,
-) -> bitcoin::Txid {
-    let point = bundle.targets[0];
-    let record = bundle.recoveries.iter().find(|r| r.controlled_outpoint == point).unwrap();
-    let paid = OutPoint::new(record.claim.compute_txid(), 0);
-    let unspent: serde_json::Value = wallet.call("listunspent", &[json!(1), json!(9999999)])
-        .expect("read beneficiary's own wallet UTXOs");
-    let spendable = unspent.as_array().unwrap().iter().filter(|coin| {
-        coin["txid"] == paid.txid.to_string() && coin["vout"] == paid.vout
-            && coin["spendable"] == true
-    }).count();
-    assert_eq!(spendable, 1, "beneficiary wallet lacks its own payout key");
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
 
-    let address: String = wallet.call("getnewaddress", &[]).unwrap();
-    let sent: String = wallet.call("sendtoaddress", &[
-        json!(address),
-        json!(format!("{:.8}", expected_amount.to_sat() as f64 / 100_000_000.0)),
-        json!(""), json!(""), json!(true),
-    ]).expect("independent Bitcoin Core wallet failed to sign and broadcast its recovered output");
-    let spend_txid: bitcoin::Txid = sent.parse().unwrap();
-    let spend = ctx.bitcoind().sync_client().get_raw_transaction(&spend_txid, None).unwrap();
-    assert_eq!(spend.input.len(), 1, "holder wallet secretly spent another funding input");
-    assert_eq!(spend.input[0].previous_output, paid,
-        "holder wallet substituted another holder's recovered coins");
-    let spent_value: Amount = spend.output.iter().map(|o| o.value).sum();
-    assert!(spent_value < expected_amount && spent_value > Amount::ZERO,
-        "external redemption must pay a positive miner fee");
-    spend_txid
+fn fixture_bitcoin_cli(ctx: &TestContext) -> PathBuf {
+    let binary = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_BITCOIN_CLI")
+        .expect("set SAPLING_TWO_HOLDER_BITCOIN_CLI to the trusted bitcoin-cli binary"));
+    assert!(binary.is_file(), "bitcoin-cli binary does not exist");
+    let raw_url = ctx.bitcoind().rpc_url().to_string();
+    let after_scheme = raw_url.strip_prefix("http://")
+        .expect("test fixture must use local plaintext Bitcoin Core RPC");
+    let authority = after_scheme.split('/').next().unwrap().rsplit('@').next().unwrap();
+    let (host, port) = authority.rsplit_once(':').expect("Bitcoin Core RPC port missing");
+    assert!(host == "127.0.0.1" || host == "localhost",
+        "the test must use an isolated loopback regtest node");
+    let port: u16 = port.parse().expect("Bitcoin Core RPC port invalid");
+    let cookie = ctx.bitcoind().rpc_cookie();
+    let wrapper = ctx.datadir.join("two-holder-bitcoin-cli.sh");
+    let shell = format!(
+        "#!/bin/sh\nexec {} -rpcconnect={} -rpcport={} -rpccookiefile={} \"$@\"\n",
+        shell_quote(&binary.to_string_lossy()),
+        shell_quote(host),
+        port,
+        shell_quote(&cookie.to_string_lossy()),
+    );
+    fs::write(&wrapper, shell).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    wrapper
+}
+
+fn run_fixture_executable(executable: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let output = std::process::Command::new(executable)
+        .args(args).output().expect("run external verifier in integration fixture");
+    assert!(output.status.success(), "external fixture command {} failed:\n{}\n{}",
+        executable.display(), String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+    output
 }
 
 #[tokio::test]
@@ -228,41 +237,67 @@ async fn sapio_real_two_holder_offline_recovery() {
             .confirmations.unwrap_or(0) >= 6);
     }
 
-    // Save pre-redemption evidence, which can be used with PR #2's
-    // independent verifier while both payout coins still remain unspent.
-    let metadata = json!({
-        "network": "regtest",
-        "setup": "real pinned SaplingOS, Bitcoin Core, and local-dev signing service",
-        "services_stopped_before_recovery": true,
-        "holders": [
-            {"holder":"alice", "controlled_outpoint":alice_point.to_string(),
-             "claim_txid":bundle_a.recoveries[0].claim.compute_txid().to_string(),
-             "sats":60000},
-            {"holder":"bob", "controlled_outpoint":bob_point.to_string(),
-             "claim_txid":bundle_b.recoveries[0].claim.compute_txid().to_string(),
-             "sats":40000}
-        ],
-        "independent_core_wallets": ["alice-recovered", "bob-recovered"]
-    });
-    save_json(&artifact_dir.join("before-redemption.json"), &metadata);
+    // Invoke the actual PR #2 standalone auditor on genuinely signed exports.
+    // The three executables are explicitly supplied by the external e2e
+    // harness; their absence fails the test instead of silently skipping.
+    let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER")
+        .expect("build the pinned two-holder bundle merger"));
+    let auditor = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_AUDITOR")
+        .expect("build the pinned SaplingOS standalone auditor"));
+    let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
+        .expect("supply the two-holder regtest PSBT spender Python path"));
+    let combined = artifact_dir.join("both-signed-recoveries.json");
+    run_fixture_executable(&merger, &[
+        alice_file.as_os_str(), bob_file.as_os_str(),
+        terms_file.as_os_str(), combined.as_os_str(),
+    ]);
+    let cli = fixture_bitcoin_cli(&ctx);
+    let audit = run_fixture_executable(&auditor, &[
+        combined.as_os_str(), terms_file.as_os_str(),
+        std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
+        std::ffi::OsStr::new("--confirmations"), std::ffi::OsStr::new("6"),
+        std::ffi::OsStr::new("--two-holder"),
+    ]);
+    let report: serde_json::Value = serde_json::from_slice(&audit.stdout)
+        .expect("auditor returned invalid JSON");
+    assert_eq!(report["two_holder"]["total_payout_sats"], 100_000);
+    assert_eq!(report["two_holder"]["holders"].as_array().unwrap().len(), 2);
+    let report_file = artifact_dir.join("two-holder-pre-spend-report.json");
+    save_json(&report_file, &report);
 
-    // Separate wallet signatures prove the beneficiaries control their own
-    // output keys; the signing actors remain stopped the entire time.
-    let spend_a = spend_one_recipient(&ctx, &alice_recipient, &bundle_a, sat(60_000));
-    let spend_b = spend_one_recipient(&ctx, &bob_recipient, &bundle_b, sat(40_000));
-    assert_ne!(spend_a, spend_b);
-    ctx.bitcoind().generate(1).await;
-    for txid in [spend_a, spend_b] {
+    // The separate recipient wallets now sign PSBTs, spending only their
+    // corresponding payouts. Python checks each recovered outpoint exactly,
+    // puts a strict upper bound on fees, and mines both spends on regtest.
+    let dest_a: String = alice_recipient.call("getnewaddress", &[]).unwrap();
+    let dest_b: String = bob_recipient.call("getnewaddress", &[]).unwrap();
+    let mine_addr = ctx.bitcoind().get_new_address().to_string();
+    let dest_a = format!("alice={dest_a}");
+    let dest_b = format!("bob={dest_b}");
+    let spend = run_fixture_executable(Path::new("/usr/bin/env"), &[
+        std::ffi::OsStr::new("python3"),
+        spender.as_os_str(), report_file.as_os_str(),
+        std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
+        std::ffi::OsStr::new("--wallet"), std::ffi::OsStr::new("alice=alice-recovered"),
+        std::ffi::OsStr::new("--wallet"), std::ffi::OsStr::new("bob=bob-recovered"),
+        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(&dest_a),
+        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(&dest_b),
+        std::ffi::OsStr::new("--mine-address"), std::ffi::OsStr::new(&mine_addr),
+        std::ffi::OsStr::new("--broadcast"),
+    ]);
+    let receipt: serde_json::Value = serde_json::from_slice(&spend.stdout)
+        .expect("independent-wallet redemption output was invalid JSON");
+    assert_eq!(receipt["independent_spends_confirmed"], true);
+    assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
+    save_json(&artifact_dir.join("two-holder-redemptions.json"), &receipt);
+
+    // Earlier reports must remain separate from post-spend reports: both
+    // recovered payout UTXOs have deliberately left the UTXO set.
+    for holder in ["alice", "bob"] {
+        let redemption = receipt["redemptions"].as_array().unwrap()
+            .iter().find(|row| row["holder"] == holder).unwrap();
+        let txid: bitcoin::Txid = redemption["txid"].as_str().unwrap().parse().unwrap();
         assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
-            .confirmations.unwrap_or(0) >= 1,
-            "independent payout spend did not confirm");
+            .confirmations.unwrap_or(0) >= 1);
     }
-
-    save_json(&artifact_dir.join("redemptions.json"), &json!({
-        "network":"regtest",
-        "alice_spend_txid":spend_a.to_string(),
-        "bob_spend_txid":spend_b.to_string(),
-        "services_stopped_before_recovery":true,
-        "independent_wallet_spends_confirmed":true
-    }));
+    fs::remove_file(cli).unwrap();
 }
