@@ -16,7 +16,7 @@
 //! member exit availability.
 
 use super::lineage::LineageGuard;
-use super::tree::{tree_spk, Node, Tree};
+use super::tree::{tree_spk, Leaf, Node, Tree};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, reason)
@@ -33,6 +33,42 @@ fn invalid(reason: &'static str) -> io::Error {
 
 fn invalid_data(error: serde_json::Error) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, error)
+}
+
+/// Canonical member allocation persisted with every pending signature.
+///
+/// This contains the complete authenticated member records, since a root hash
+/// alone cannot recover balances, owner identities or future exit witnesses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeSnapshot {
+    /// Full binary-tree depth for this fixed LayerTree lineage.
+    pub depth: u8,
+    /// Occupied leaf positions and complete fixed-width member records.
+    pub leaves: Vec<(u32, Leaf)>,
+}
+
+impl TreeSnapshot {
+    /// Snapshot every occupied leaf in canonical ascending-position order.
+    pub fn from_tree(tree: &Tree) -> Self {
+        Self {
+            depth: tree.depth(),
+            leaves: tree.leaves().map(|(index, leaf)| (index, leaf.clone())).collect(),
+        }
+    }
+
+    /// Rebuild the Merkle-sum tree, checking position bounds and duplicates.
+    pub fn rebuild(&self) -> Result<Tree, &'static str> {
+        let mut tree = Tree::new(self.depth)?;
+        let mut previous = None;
+        for (position, leaf) in &self.leaves {
+            if previous.is_some_and(|prev| prev >= *position) {
+                return Err("noncanonical or repeated saved member position");
+            }
+            tree.set(*position, Some(leaf.clone()))?;
+            previous = Some(*position);
+        }
+        Ok(tree)
+    }
 }
 
 /// Exact unsigned Bitcoin transaction committed before releasing any signature.
@@ -46,6 +82,33 @@ pub struct SigningReservation {
     pub before: Node,
     /// New Merkle-sum commitment, including all member allocations.
     pub after: Node,
+    /// Exact previous Bitcoin output used when the signature was prepared.
+    pub prevout: TxOut,
+    /// Full unsigned Bitcoin transaction to reconstruct after process loss.
+    pub unsigned_tx: Transaction,
+    /// Canonical full member allocation before signing.
+    pub current: TreeSnapshot,
+    /// Canonical full member allocation after the proposed spend.
+    pub successor: TreeSnapshot,
+}
+
+impl SigningReservation {
+    /// Reconstruct complete predecessor and successor states from saved bytes.
+    ///
+    /// The caller must independently validate the live Bitcoin transaction.
+    pub fn restore(&self) -> Result<(Tree, Tree), &'static str> {
+        let current = self.current.rebuild()?;
+        let successor = self.successor.rebuild()?;
+        if current.root() != self.before || successor.root() != self.after {
+            return Err("saved member records differ from Merkle-sum commitments");
+        }
+        if self.unsigned_tx.compute_txid() != self.txid
+            || self.unsigned_tx.input.first().map(|input| input.previous_output) != Some(self.input)
+        {
+            return Err("saved unsigned Bitcoin transaction changed");
+        }
+        Ok((current, successor))
+    }
 }
 
 /// Persistable coordinator journal for one canonical shared output.
@@ -159,8 +222,55 @@ impl LineageJournal {
             txid,
             before: current.root(),
             after: next.root(),
+            prevout: prevout.clone(),
+            unsigned_tx: transaction.clone(),
+            current: TreeSnapshot::from_tree(current),
+            successor: TreeSnapshot::from_tree(next),
         });
         Ok(txid)
+    }
+
+    /// Reconstruct a pending authorization using only the durable journal.
+    ///
+    /// The state is authenticated against its saved roots, canonical current
+    /// outpoint and expected payout script. This is local consistency, not
+    /// proof of Bitcoin confirmation or resistance to malicious file rollback.
+    pub fn saved_pending(&self) -> Result<Option<(Tree, Tree, Transaction)>, &'static str> {
+        let Some(pending) = self.pending.as_ref() else { return Ok(None) };
+        if pending.input != self.outpoint {
+            return Err("saved transaction uses obsolete canonical outpoint");
+        }
+        let (current, successor) = pending.restore()?;
+        self.guard.check(self.guard.tree_id(), &current, &successor)?;
+        if pending.prevout.value.to_sat() != current.root().sum
+            || pending.prevout.script_pubkey != tree_spk(current.root().hash, self.script_root)?
+        {
+            return Err("saved funding output differs from committed predecessor");
+        }
+        let output = pending.unsigned_tx.output.first()
+            .ok_or("saved pending transaction is missing successor output")?;
+        if output.value.to_sat() != successor.root().sum {
+            return Err("saved successor amount changed");
+        }
+        if successor.root().sum == 0 {
+            if output.script_pubkey != ScriptBuf::from_bytes(vec![0x6a]) {
+                return Err("saved terminal successor output changed");
+            }
+        } else if output.script_pubkey != tree_spk(successor.root().hash, self.script_root)? {
+            return Err("saved successor script commitment changed");
+        }
+        Ok(Some((current, successor, pending.unsigned_tx.clone())))
+    }
+
+    /// After independently authenticating the confirmed txid, advance using
+    /// complete member states restored from the durable pending reservation.
+    pub fn confirm_saved(&mut self, confirmed: Txid) -> Result<(), &'static str> {
+        let (current, successor, unsigned) = self.saved_pending()?
+            .ok_or("no saved transaction to confirm")?;
+        if unsigned.compute_txid() != confirmed {
+            return Err("confirmed chain transaction differs from saved reservation");
+        }
+        self.confirm(confirmed, &current, &successor)
     }
 
     /// Check that a signer is using the *exact* durably reserved transaction.
@@ -307,6 +417,7 @@ impl LockedLineage {
         if state.version != JOURNAL_VERSION {
             return Err(invalid("unsupported LayerTree journal version"));
         }
+        state.saved_pending().map_err(invalid)?;
         Ok(Self {
             path,
             _lock: lock,
@@ -354,6 +465,26 @@ impl LockedLineage {
             ));
         }
         self.state.permit(transaction).map_err(invalid)
+    }
+
+    /// Confirm from the complete saved reservation after an independent chain
+    /// observer authenticated the exact Bitcoin txid at adequate depth.
+    ///
+    /// The journal itself cannot query Bitcoin or independently prove that
+    /// the supplied confirmation exists. This method restores saved member
+    /// allocations instead of trusting a restarted process to remember them.
+    pub fn confirm_saved(&mut self, confirmed: Txid) -> io::Result<()> {
+        if self.poisoned {
+            return Err(invalid("uncertain LayerTree journal write; reopen after recovery"));
+        }
+        let mut proposed = self.state.clone();
+        proposed.confirm_saved(confirmed).map_err(invalid)?;
+        if let Err(error) = persist(&self.path, &proposed) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.state = proposed;
+        Ok(())
     }
 
     /// Persist the canonical root after the chain independently confirms the
