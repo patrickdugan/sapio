@@ -269,6 +269,40 @@ achow101, Sjors and Emzy builder attestations in the pinned
 The workflow artifact is named to distinguish wallet-only results from real
 SaplingOS recovery evidence.
 
+## Preparing the real local-dev Sapio signer
+
+The source for the actual signing service is
+[stutxo/sapio_tee](https://github.com/stutxo/sapio_tee), pinned to
+`f083bdbd2343aad22fab861f1565c0f2c2e6b0af`.
+The pinned signer passed its [upstream build and integration CI]
+(https://github.com/stutxo/sapio_tee/actions/runs/39414465510).
+Its `ark-lib` dependency uses `stutxo/saplingos@758f7b730`;
+the auditor's SDK revision `b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d`
+adds only wallet-hook and fixture-runner changes above that protocol source.
+
+A public-source bootstrap is provided to fetch and build this exact signer
+with its own Nix toolchain (Rust 1.98.1). It verifies the locked Ark library
+revision and the reviewed BIP-446 template-hash v1 WASM digest.
+
+```sh
+bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh
+```
+
+After building, it starts the signer on isolated loopback ports, checks the
+ephemeral `local-dev` identity, shuts it down and prints shell export commands
+for `SAPIO_TEE_EXEC` and `SAPIO_TEMPLATEHASH_WASM`. Apply those commands
+before running the two-holder recovery driver. The optional `--build-only`
+mode skips the test service startup when ports 8000 and 8367 are unavailable.
+`SAPLING_TEE_SOURCE_DIR` selects a custom clean public checkout.
+If `SAPLINGOS_CHECKOUT` is already set and contains the pinned ancestors,
+the bootstrap checks the tee's Ark protocol revision against that SDK.
+
+**Local-dev is a disposable regtest signer.** Its root changes on every
+restart and has no Nitro measurement or KMS key recovery. The full rehearsal
+must prepare and save immutable claims before deliberately shutting it down.
+The separate Ark server, Bitcoin Core, CLN, PostgreSQL and watchman
+fixture binaries remain required by the native SaplingOS service suite.
+
 ## Running the genuine two-holder service-shutdown fixture
 
 An opt-in integration test at
