@@ -600,6 +600,170 @@ fn two_members_exit_sequentially_without_either_coparticipants_signature() {
 }
 
 #[test]
+fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
+    use sapio_contrib::contracts::layertree::{LineageJournal, LockedLineage};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let contract = LayerTree::new(
+        Config {
+            depth: 2,
+            ..example::contract().unwrap().config().clone()
+        },
+        Xpub::from_priv(secp(), &example::oracle_key()),
+    )
+    .unwrap();
+    let mut tree = Tree::new(2).unwrap();
+    let alice = example::member(210, 60_000);
+    let bob = example::member(211, 40_000);
+    tree.set(0, Some(alice.clone())).unwrap();
+    tree.set(1, Some(bob.clone())).unwrap();
+    let current_coin = principal(&contract, &tree, 95);
+    let compiled = example::compile(&contract, &tree).unwrap();
+    let script_root = sapio_contrib::contracts::layertree::script_tree_root(&compiled).unwrap();
+    let journal = LineageJournal::bootstrap(
+        contract.config().tree_id,
+        script_root,
+        current_coin.outpoint,
+        &tree,
+    )
+    .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "layertree-signed-reserve-{}-{}.json",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    // Persist the exact unsigned spend BEFORE Alice's owner signature exists.
+    let mut wallet = LockedLineage::create(&path, journal).unwrap();
+    let first = example::prepare_step_reserved(
+        &contract,
+        &tree,
+        current_coin,
+        Transition::Exit { count: 1 },
+        vec![example::payout(&alice)],
+        0,
+        96,
+        &mut wallet,
+        |sign, m| witness::exit(&tree, &[(0, false, sign(&example::key(210)))], m),
+    )
+    .unwrap();
+    let first_tx = example::finish(&first, &example::oracle().unwrap()).unwrap();
+    assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    assert_eq!(first_tx.output[1], example::payout(&alice));
+    // The wallet process disappears after authorization, before confirmation.
+    drop(wallet);
+
+    let mut wallet = LockedLineage::open(&path).unwrap();
+    assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    assert!(example::prepare_step_reserved(
+        &contract,
+        &tree,
+        principal(&contract, &tree, 97),
+        Transition::Exit { count: 1 },
+        vec![example::payout(&alice)],
+        0,
+        98,
+        &mut wallet,
+        |sign, m| witness::exit(&tree, &[(0, false, sign(&example::key(210)))], m),
+    ).is_err());
+    // A real coordinator must check the confirmed txid with Bitcoin Core.
+    // We model that authenticated notification here.
+    wallet.confirm(first_tx.compute_txid(), &tree, &first.next).unwrap();
+
+    let second_coin = successor(&first_tx);
+    let second = example::prepare_step_reserved(
+        &contract,
+        &first.next,
+        second_coin,
+        Transition::Exit { count: 1 },
+        vec![example::payout(&bob)],
+        0,
+        99,
+        &mut wallet,
+        |sign, m| {
+            witness::exit(
+                &first.next,
+                &[(1, false, sign(&example::key(211)))],
+                m,
+            )
+        },
+    )
+    .unwrap();
+    let second_tx = example::finish(&second, &example::oracle().unwrap()).unwrap();
+    assert_eq!(wallet.permit(&second_tx).unwrap(), second_tx.compute_txid());
+    assert_eq!(second_tx.output[1], example::payout(&bob));
+    wallet.confirm(second_tx.compute_txid(), &first.next, &second.next).unwrap();
+    assert_eq!(wallet.state().root(), Node::empty(2));
+    assert!(wallet.state().pending().is_none());
+    drop(wallet);
+
+    let restored = LockedLineage::open(&path).unwrap();
+    assert_eq!(restored.state().root(), Node::empty(2));
+    assert_eq!(restored.state().guard().historical_identities(), 2);
+    drop(restored);
+    std::fs::remove_file(&path).unwrap();
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    std::fs::remove_file(std::path::PathBuf::from(lock)).unwrap();
+}
+
+#[test]
+fn signing_failure_after_fsync_leaves_a_sticky_reservation() {
+    use sapio_contrib::contracts::layertree::{LineageJournal, LockedLineage};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let contract = example::contract().unwrap();
+    let tree = example::initial_tree().unwrap();
+    let coin = principal(&contract, &tree, 102);
+    let compiled = example::compile(&contract, &tree).unwrap();
+    let script_root = sapio_contrib::contracts::layertree::script_tree_root(&compiled).unwrap();
+    let journal = LineageJournal::bootstrap(
+        contract.config().tree_id,
+        script_root,
+        coin.outpoint,
+        &tree,
+    )
+    .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "layertree-crash-reserve-{}-{}.json",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut wallet = LockedLineage::create(&path, journal).unwrap();
+    let attempted = example::prepare_step_reserved(
+        &contract,
+        &tree,
+        coin,
+        Transition::Exit { count: 1 },
+        vec![example::payout(tree.leaf(2).unwrap())],
+        0,
+        103,
+        &mut wallet,
+        |sign, m| {
+            let owner_sig = sign(&example::key(212));
+            if !owner_sig.is_empty() {
+                return Err("synthetic signer crashed after journal fsync");
+            }
+            witness::exit(&tree, &[(2, false, owner_sig)], m)
+        },
+    );
+    assert!(attempted.is_err());
+    let pending = wallet.state().pending().cloned().unwrap();
+    drop(wallet);
+
+    let recovered = LockedLineage::open(&path).unwrap();
+    assert_eq!(recovered.state().pending(), Some(&pending));
+    assert_eq!(recovered.state().root(), tree.root());
+    drop(recovered);
+    std::fs::remove_file(&path).unwrap();
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    std::fs::remove_file(std::path::PathBuf::from(lock)).unwrap();
+}
+
+#[test]
 fn final_member_exit_closes_the_pool_and_depth_sixteen_remains_executable() {
     for depth in [1, 16] {
         let contract = LayerTree::new(
