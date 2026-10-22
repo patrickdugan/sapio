@@ -365,3 +365,198 @@ async fn sapio_real_two_holder_offline_recovery() {
     }
     fs::remove_file(cli).unwrap();
 }
+
+#[tokio::test]
+async fn sapio_real_common_anchor_two_holder_recovery() {
+    let _exclusive = TEE_LOCK.lock().await;
+    let ctx = TestContext::new("sapling_sdk/sapio_real_common_anchor_two_holder_recovery").await;
+    let tee = SapioTee::launch(&ctx).await;
+    let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
+        .funded(btc(1)).create().await;
+
+    // One genuine funded root VTXO is split by sequential native Ark
+    // transfers to two *different* Sapio program-wallet recipients.
+    // Their recovery ancestry is required to share the same chain anchor.
+    let sender = ctx.sdk("sender", &srv).boarded(sat(120_000)).create().await;
+    let original = sender.spendable_vtxos().await.unwrap();
+    assert_eq!(original.len(), 1);
+    assert_eq!(original[0].amount(), sat(120_000));
+    let anchor = original[0].vtxo.chain_anchor();
+    drop(original);
+
+    let (alice_core, alice_script) = new_recipient_wallet(&ctx, "alice-recovered");
+    let (bob_core, bob_script) = new_recipient_wallet(&ctx, "bob-recovered");
+    assert_ne!(alice_script, bob_script);
+    let program = lifecycle_program();
+    let program_id = program.id().to_string();
+    let signer_root = tee.public_root().to_string();
+    let seed_a = bip39::Mnemonic::generate(12).unwrap();
+    let seed_b = bip39::Mnemonic::generate(12).unwrap();
+    assert_ne!(seed_a.to_string(), seed_b.to_string());
+
+    let (alice_socket, alice_url) = listener().await;
+    let (bob_socket, bob_url) = listener().await;
+    let config_a = config(&tee, program.clone(),
+        recovery(alice_script.clone(), 0u32.to_le_bytes().to_vec()), Some(alice_url));
+    let config_b = config(&tee, program,
+        recovery(bob_script.clone(), 0u32.to_le_bytes().to_vec()), Some(bob_url));
+    let evidence_a = seed_a.clone();
+    let evidence_b = seed_b.clone();
+    let alice = ctx.sdk("alice", &srv).mnemonic(seed_a).funded(sat(500_000))
+        .cfg(move |c| configure_wallet(c, config_a, &evidence_a)).create().await;
+    let bob = ctx.sdk("bob", &srv).mnemonic(seed_b).funded(sat(500_000))
+        .cfg(move |c| configure_wallet(c, config_b, &evidence_b)).create().await;
+    let coordinator_a = Receiver::start(alice_socket, &alice);
+    let coordinator_b = Receiver::start(bob_socket, &bob);
+
+    let alice_address = alice.new_address().await.unwrap();
+    sender.send_arkoor_payment(&alice_address, sat(60_000)).await
+        .expect("real Sapio first transfer must commit Alice's 60k right");
+    let bob_address = bob.new_address().await.unwrap();
+    sender.send_arkoor_payment(&bob_address, sat(40_000)).await
+        .expect("real Sapio second transfer must commit Bob's 40k right");
+
+    let alice_positions = alice.spendable_vtxos().await.unwrap();
+    let bob_positions = bob.spendable_vtxos().await.unwrap();
+    assert_eq!(alice_positions.len(), 1);
+    assert_eq!(bob_positions.len(), 1);
+    assert_eq!(alice_positions[0].amount(), sat(60_000));
+    assert_eq!(bob_positions[0].amount(), sat(40_000));
+    let alice_point = alice_positions[0].vtxo.point();
+    let bob_point = bob_positions[0].vtxo.point();
+    assert_ne!(alice_point, bob_point);
+    assert_eq!(alice_positions[0].vtxo.chain_anchor(), anchor,
+        "Alice lost the source's common economic root");
+    assert_eq!(bob_positions[0].vtxo.chain_anchor(), anchor,
+        "Bob's signed VTXO does not share Alice's source funding anchor");
+
+    let terms = json!({
+        "version":1,
+        "network":"regtest",
+        "targets":[
+            {
+                "outpoint":alice_point.to_string(),
+                "program":{
+                    "program_id":program_id.clone(),
+                    "signer_root":signer_root.clone(),
+                    "user_pubkey":alice_positions[0].vtxo.user_pubkey().to_string()
+                },
+                "beneficiaries":[
+                    {"holder":"alice", "script_pubkey_hex":script_hex(&alice_script), "sats":60000}
+                ]
+            },
+            {
+                "outpoint":bob_point.to_string(),
+                "program":{
+                    "program_id":program_id,
+                    "signer_root":signer_root,
+                    "user_pubkey":bob_positions[0].vtxo.user_pubkey().to_string()
+                },
+                "beneficiaries":[
+                    {"holder":"bob", "script_pubkey_hex":script_hex(&bob_script), "sats":40000}
+                ]
+            }
+        ]
+    });
+    drop(alice_positions);
+    drop(bob_positions);
+    let dir = std::env::var_os("SAPLING_TWO_HOLDER_CAPTURE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.datadir.join("two-holder-common-anchor"));
+    fs::create_dir_all(&dir).unwrap();
+    let terms_file = dir.join("two-holder-terms.json");
+    save_json(&terms_file, &terms);
+
+    let bundle_a = alice.program_recovery_bundle(&[alice_point]).await.unwrap();
+    let bundle_b = bob.program_recovery_bundle(&[bob_point]).await.unwrap();
+    assert_eq!(bundle_a.targets, vec![alice_point]);
+    assert_eq!(bundle_b.targets, vec![bob_point]);
+    assert_eq!(bundle_a.readiness(alice_point).unwrap(), ProgramRecoveryReadiness::Complete);
+    assert_eq!(bundle_b.readiness(bob_point).unwrap(), ProgramRecoveryReadiness::Complete);
+    bundle_a.verify().unwrap();
+    bundle_b.verify().unwrap();
+    let alice_file = dir.join("alice-recovery.json");
+    let bob_file = dir.join("bob-recovery.json");
+    save_json(&alice_file, &bundle_a);
+    save_json(&bob_file, &bundle_b);
+    drop(coordinator_a);
+    drop(coordinator_b);
+
+    // Stop every signer and every owner SDK before recovery publication.
+    alice.stop_daemon_wait().await.unwrap();
+    bob.stop_daemon_wait().await.unwrap();
+    sender.stop_daemon_wait().await.unwrap();
+    drop(alice);
+    drop(bob);
+    drop(sender);
+    tee.stop().await.unwrap();
+    srv.stop().await.unwrap();
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err());
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err());
+
+    recover_offline(&ctx, "alice", Some(&alice_file), &bundle_a).await;
+    assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
+    assert!(ctx.bitcoind().sync_client().get_raw_transaction(
+        &bundle_b.recoveries.iter().find(|r| r.controlled_outpoint == bob_point)
+            .unwrap().claim.compute_txid(), None).is_err(),
+        "Bob's VTXO paid out before Bob independently requested his recovery");
+    recover_offline(&ctx, "bob", Some(&bob_file), &bundle_b).await;
+    assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
+    ctx.bitcoind().generate(6).await;
+
+    let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER")
+        .expect("build the pinned merged-bundle verifier"));
+    let auditor = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_AUDITOR")
+        .expect("build the independently pinned SaplingOS auditor"));
+    let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
+        .expect("supply independent Bitcoin Core PSBT spend runner"));
+    let merged = dir.join("both-signed-recoveries.json");
+    run_fixture_executable(&merger, &[
+        alice_file.as_os_str(), bob_file.as_os_str(),
+        terms_file.as_os_str(), merged.as_os_str()
+    ]);
+    let cli = fixture_bitcoin_cli(&ctx);
+    let audited = run_fixture_executable(&auditor, &[
+        merged.as_os_str(), terms_file.as_os_str(),
+        std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
+        std::ffi::OsStr::new("--confirmations"), std::ffi::OsStr::new("6"),
+        std::ffi::OsStr::new("--two-holder"),
+    ]);
+    let report: serde_json::Value = serde_json::from_slice(&audited.stdout).unwrap();
+    assert_eq!(report["offline"]["total_protected_sats"], 100_000);
+    assert_eq!(report["two_holder"]["total_payout_sats"], 100_000);
+    assert_eq!(report["offline"]["selected_paths_nonconflicting"], true);
+    assert_eq!(report["two_holder"]["holders"].as_array().unwrap().len(), 2);
+    save_json(&dir.join("two-holder-pre-spend-report.json"), &report);
+
+    let fee_proof = json!({
+        "alice":observed_fee_child(&ctx, &bundle_a),
+        "bob":observed_fee_child(&ctx, &bundle_b),
+        "shared_chain_anchor":anchor.to_string(),
+        "real_common_root":true,
+        "services_offline_when_fee_children_mined":true
+    });
+    save_json(&dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
+
+    let alice_dest: String = alice_core.call("getnewaddress", &[]).unwrap();
+    let bob_dest: String = bob_core.call("getnewaddress", &[]).unwrap();
+    let mine_addr = ctx.bitcoind().get_new_address().to_string();
+    let alice_arg = format!("alice={alice_dest}");
+    let bob_arg = format!("bob={bob_dest}");
+    let redemption = run_fixture_executable(Path::new("/usr/bin/env"), &[
+        std::ffi::OsStr::new("python3"), spender.as_os_str(),
+        dir.join("two-holder-pre-spend-report.json").as_os_str(),
+        std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
+        std::ffi::OsStr::new("--wallet"), std::ffi::OsStr::new("alice=alice-recovered"),
+        std::ffi::OsStr::new("--wallet"), std::ffi::OsStr::new("bob=bob-recovered"),
+        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(alice_arg.as_str()),
+        std::ffi::OsStr::new("--destination"), std::ffi::OsStr::new(bob_arg.as_str()),
+        std::ffi::OsStr::new("--mine-address"), std::ffi::OsStr::new(mine_addr.as_str()),
+        std::ffi::OsStr::new("--broadcast"),
+    ]);
+    let receipt: serde_json::Value = serde_json::from_slice(&redemption.stdout).unwrap();
+    assert_eq!(receipt["independent_spends_confirmed"], true);
+    assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
+    save_json(&dir.join("two-holder-redemptions.json"), &receipt);
+    fs::remove_file(cli).unwrap();
+}
