@@ -126,13 +126,12 @@ fn main() -> Result<()> {
     let merged = combine(alice, bob)?;
     let checked = audit_bundle(&merged, &terms)
         .context("merged signed recovery claims do not match independently agreed payouts")?;
+    let expected_principal = terms.targets.iter().try_fold(0u64, |sum, target| {
+        sum.checked_add(target.beneficiaries[0].sats)
+            .context("independent participant total overflows")
+    })?;
     ensure!(
-        checked.total_protected_sats
-            == terms
-                .targets
-                .iter()
-                .map(|target| target.beneficiaries[0].sats)
-                .sum::<u64>(),
+        checked.total_protected_sats == expected_principal,
         "merged recovery principal differs from independent participant rights"
     );
 
