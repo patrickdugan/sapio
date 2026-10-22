@@ -228,8 +228,12 @@ pub fn verify_confirmed_claim(
         "saved recovery claim has insufficient confirmations"
     );
     ensure!(
-        onchain.transaction.compute_txid() == txid && onchain.transaction.output == claim.output,
-        "confirmed transaction differs from the signed recovery claim"
+        claim.input.len() == 1 && claim.input[0].previous_output == controlled,
+        "saved recovery claim spends a different controlled outpoint"
+    );
+    ensure!(
+        onchain.transaction == *claim,
+        "confirmed transaction differs from the exact saved signed recovery"
     );
     let mut payouts = Vec::new();
     let mut holders = HashSet::new();
@@ -462,6 +466,41 @@ mod tests {
             unspent: HashSet::new(),
         };
         assert!(verify_confirmed_claim(&view, &claim, &aliases, OutPoint::null(), 6,).is_err());
+    }
+
+    #[test]
+    fn different_witness_with_the_same_txid_fails_exact_saved_claim_check() {
+        let (mut claim, recipients) = fixture();
+        // P2TR witness does not affect txid. Our observer must still bind
+        // the exact witness saved by SaplingOS, not just the txid/outputs.
+        claim.input[0].witness.push([1u8; 64]);
+        let mut mutated = claim.clone();
+        mutated.input[0].witness = bitcoin::Witness::new();
+        assert_eq!(mutated.compute_txid(), claim.compute_txid());
+        let view = FakeView {
+            network: "regtest".into(),
+            tx: Some(ObservedTransaction {
+                transaction: mutated,
+                confirmations: 12,
+            }),
+            unspent: HashSet::new(),
+        };
+        assert!(verify_confirmed_claim(&view, &claim, &recipients, OutPoint::null(), 6).is_err());
+    }
+
+    #[test]
+    fn confirmed_claim_must_spend_the_agreed_vtxo_outpoint() {
+        let (claim, recipients) = fixture();
+        let view = FakeView {
+            network: "regtest".into(),
+            tx: Some(ObservedTransaction {
+                transaction: claim.clone(),
+                confirmations: 12,
+            }),
+            unspent: HashSet::new(),
+        };
+        let another = OutPoint::new(claim.compute_txid(), 2);
+        assert!(verify_confirmed_claim(&view, &claim, &recipients, another, 6).is_err());
     }
 
     #[test]
