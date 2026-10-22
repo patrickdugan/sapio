@@ -159,6 +159,17 @@ fn frozen_recovery_evidence(paths: &[&Path]) -> serde_json::Value {
     })
 }
 
+/// Check the original independent agreement and immutable signed exports
+/// against the bytes captured *before* signing services were stopped.
+/// Catch silent on-disk rollback, replacement, or mutation after outage.
+fn assert_frozen_recovery_evidence(paths: &[&Path], frozen: &serde_json::Value) {
+    assert_eq!(
+        &frozen_recovery_evidence(paths),
+        frozen,
+        "independent terms or signed recovery export changed after service shutdown"
+    );
+}
+
 fn assert_saved_claim(
     ctx: &TestContext,
     saved: &ProgramRecoveryBundle,
@@ -463,6 +474,8 @@ async fn sapio_real_two_holder_offline_recovery() {
     let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
         .expect("supply the two-holder regtest PSBT spender Python path"));
     let combined = artifact_dir.join("both-signed-recoveries.json");
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
     run_fixture_executable(&merger, &[
         alice_file.as_os_str(), bob_file.as_os_str(),
         terms_file.as_os_str(), combined.as_os_str(),
@@ -515,6 +528,8 @@ async fn sapio_real_two_holder_offline_recovery() {
         assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
             .confirmations.unwrap_or(0) >= 1);
     }
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
     fs::remove_file(cli).unwrap();
 }
 
