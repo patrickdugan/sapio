@@ -109,6 +109,47 @@ ancestor or `Conditional` recovery is rejected because it may require an
 additional service publication. A mismatched output script, a 1-sat
 misallocation, additional recipient, or missing anchor fails the audit.
 
+
+## Two independently confirmed holders
+
+For the two-holder experiment, prepare a genuine SaplingOS export with **two
+different selected controlled VTXOs**. Supply independent terms with exactly
+one beneficiary on each target (for example, Alice 60,000 sats and Bob
+40,000 sats). This distinction matters: one joint claim paying two scripts
+alone is not evidence that Alice and Bob can each recover a separate VTXO.
+
+After the Sapio cosigner and Ark service have been stopped and the
+**unchanged signed** claims have confirmed through an independently funded
+ordinary fee wallet, ask the auditor for a strict two-holder receipt:
+
+```sh
+cargo run --locked --manifest-path contrib/sapling-vtxo-entitlements/Cargo.toml -- \
+  /private/two-holder-export.json /private/two-holder-terms.json \
+  --bitcoin-cli /trusted/path/to/bitcoin-cli --datadir /private/bitcoin \
+  --confirmations 6 --two-holder
+```
+
+The new `two_holder` JSON section requires two distinct confirmed claim
+txids, two different beneficiary scripts, the exact separately agreed
+amounts and **two unspent** payout outpoints on the expected Bitcoin Core
+chain. It binds each payout to its own claimed VTXO and rejects duplicate
+holder labels, shared scripts, missing claims, ambiguous receipts and
+spent outputs. The strict check is deliberately post-confirmation and
+should run before redeeming either holder's Bitcoin UTXO.
+
+`unilateral_spend_authority_checked=false` and
+`services_offline_during_recovery_checked=false` remain explicit in the
+report. They require **additional external evidence**, such as independently
+signed and mined spends by Alice's and Bob's separate fee-capable Bitcoin
+wallets, and a harness log showing that the Ark and Sapio signing services
+were stopped **before** recovery publication. The reporting tool alone
+cannot establish those facts.
+
+The repository currently has deterministic fake-node regressions covering
+the two-claim shape. A **real signed export** and Bitcoin Core regtest
+service-shutdown capture must be supplied by a SaplingOS integration run
+before a complete two-holder recovery claim can be made.
+
 ## Verification boundaries
 
 A successful report means the existing SaplingOS cryptographic verifier
