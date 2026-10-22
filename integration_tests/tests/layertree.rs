@@ -426,6 +426,348 @@ fn vouchers_cannot_replay_after_sequence_advance_and_hashlocks_bind_exact_preima
 }
 
 #[test]
+fn historical_owner_nonce_reuse_revives_a_signed_voucher_in_the_real_mid_guest() {
+    use sapio_contrib::contracts::layertree::LineageGuard;
+
+    let contract = example::contract().unwrap();
+    let initial = example::initial_tree().unwrap();
+    let owner = initial.leaf(0).unwrap().clone();
+    let claim = example::member(214, 10_000);
+    // Sign once, in the initial state. A voucher binds lineage and leaf
+    // body (including owner, nonce and seq), but not the current outpoint.
+    let stale_voucher = example::sign_voucher(
+        owner.voucher_message(contract.config().tree_id, &claim),
+        &example::key(210),
+    );
+
+    // Both UPDATEs below have fresh owner and operator signatures.
+    // The first retires owner/nonce 210, the second reintroduces exactly
+    // that 116-byte record, restoring its voucher message.
+    let mut replacement = owner.clone();
+    replacement.owner_key = example::key(220).x_only_public_key().0;
+    replacement.nonce = 220;
+    let away = example::prepare_step(
+        &contract,
+        &initial,
+        principal(&contract, &initial, 80),
+        Transition::Update,
+        vec![],
+        0,
+        81,
+        |sign, m| {
+            witness::update(
+                &initial,
+                0,
+                replacement.clone(),
+                &sign(&example::key(210)),
+                &sign(&example::operator()),
+                m,
+            )
+        },
+    )
+    .unwrap();
+    let away_tx = example::finish(&away, &example::oracle().unwrap()).unwrap();
+
+    let restored = example::prepare_step(
+        &contract,
+        &away.next,
+        successor(&away_tx),
+        Transition::Update,
+        vec![],
+        0,
+        82,
+        |sign, m| {
+            witness::update(
+                &away.next,
+                0,
+                owner.clone(),
+                &sign(&example::key(220)),
+                &sign(&example::operator()),
+                m,
+            )
+        },
+    )
+    .unwrap();
+    let restored_tx = example::finish(&restored, &example::oracle().unwrap()).unwrap();
+    assert_eq!(restored.next.root(), initial.root());
+
+    // The old voucher is now accepted by the genuine compiled MID WASM
+    // evaluator against a newly signed Bitcoin transaction.
+    let replay = claim_step(
+        &contract,
+        &restored.next,
+        successor(&restored_tx),
+        &claim,
+        &stale_voucher,
+        None,
+        83,
+    );
+    let claimed = example::finish(&replay, &example::oracle().unwrap()).unwrap();
+    assert_eq!(claimed.output[0].value.to_sat(), initial.root().sum);
+    assert_eq!(replay.next.leaf(4), Some(&claim));
+
+    // An application that persisted its identity history would have refused
+    // to issue the second UPDATE's signatures before the replayable state.
+    let mut guard = LineageGuard::bootstrap(contract.config().tree_id, &initial);
+    guard
+        .advance(contract.config().tree_id, &initial, &away.next)
+        .unwrap();
+    assert_eq!(
+        guard.check(contract.config().tree_id, &away.next, &restored.next),
+        Err("historical LayerTree owner/nonce identity reused")
+    );
+
+    // The guarded preparation stops before creating any transaction
+    // signatures. The plain preparation above exists only to demonstrate
+    // why a wallet's historic tombstones are necessary.
+    let refusal = example::prepare_step_guarded(
+        &contract,
+        &away.next,
+        successor(&away_tx),
+        Transition::Update,
+        vec![],
+        0,
+        84,
+        &guard,
+        |sign, m| {
+            witness::update(
+                &away.next,
+                0,
+                owner.clone(),
+                &sign(&example::key(220)),
+                &sign(&example::operator()),
+                m,
+            )
+        },
+    );
+    assert!(refusal
+        .err()
+        .expect("guarded preparation must fail")
+        .to_string()
+        .contains("historical LayerTree"));
+}
+
+#[test]
+fn two_members_exit_sequentially_without_either_coparticipants_signature() {
+    let contract = LayerTree::new(
+        Config {
+            depth: 2,
+            ..example::contract().unwrap().config().clone()
+        },
+        Xpub::from_priv(secp(), &example::oracle_key()),
+    )
+    .unwrap();
+    let mut tree = Tree::new(2).unwrap();
+    let alice = example::member(210, 60_000);
+    let bob = example::member(211, 40_000);
+    tree.set(0, Some(alice.clone())).unwrap();
+    tree.set(1, Some(bob.clone())).unwrap();
+
+    // The owner-authorized EXIT_1 witness has Alice's signature; no
+    // signature by Bob or by the operator is included.
+    let first = example::prepare_step(
+        &contract,
+        &tree,
+        principal(&contract, &tree, 90),
+        Transition::Exit { count: 1 },
+        vec![example::payout(&alice)],
+        0,
+        91,
+        |sign, m| witness::exit(&tree, &[(0, false, sign(&example::key(210)))], m),
+    )
+    .unwrap();
+    let first_tx = example::finish(&first, &example::oracle().unwrap()).unwrap();
+    assert_eq!(first_tx.output[1], example::payout(&alice));
+    assert_eq!(first.next.root().sum, 40_000);
+
+    // The exact remaining principal belongs to Bob's leaf. He can exit
+    // without Alice, under the same online Sapio oracle trust assumption.
+    let second = example::prepare_step(
+        &contract,
+        &first.next,
+        successor(&first_tx),
+        Transition::Exit { count: 1 },
+        vec![example::payout(&bob)],
+        0,
+        92,
+        |sign, m| witness::exit(&first.next, &[(1, false, sign(&example::key(211)))], m),
+    )
+    .unwrap();
+    let second_tx = example::finish(&second, &example::oracle().unwrap()).unwrap();
+    assert_eq!(second_tx.output[1], example::payout(&bob));
+    assert_eq!(second.next.root(), Node::empty(2));
+    assert_eq!(second_tx.output[0].value, Amount::ZERO);
+}
+
+#[test]
+fn synced_signing_reservation_survives_restart_and_binds_both_exits() {
+    use sapio_contrib::contracts::layertree::{LineageJournal, LockedLineage};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let contract = LayerTree::new(
+        Config {
+            depth: 2,
+            ..example::contract().unwrap().config().clone()
+        },
+        Xpub::from_priv(secp(), &example::oracle_key()),
+    )
+    .unwrap();
+    let mut tree = Tree::new(2).unwrap();
+    let alice = example::member(210, 60_000);
+    let bob = example::member(211, 40_000);
+    tree.set(0, Some(alice.clone())).unwrap();
+    tree.set(1, Some(bob.clone())).unwrap();
+    let current_coin = principal(&contract, &tree, 95);
+    let compiled = example::compile(&contract, &tree).unwrap();
+    let script_root = sapio_contrib::contracts::layertree::script_tree_root(&compiled).unwrap();
+    let journal = LineageJournal::bootstrap(
+        contract.config().tree_id,
+        script_root,
+        current_coin.outpoint,
+        &tree,
+    )
+    .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "layertree-signed-reserve-{}-{}.json",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    // Persist the exact unsigned spend BEFORE Alice's owner signature exists.
+    let mut wallet = LockedLineage::create(&path, journal).unwrap();
+    let first = example::prepare_step_reserved(
+        &contract,
+        &tree,
+        current_coin,
+        Transition::Exit { count: 1 },
+        vec![example::payout(&alice)],
+        0,
+        96,
+        &mut wallet,
+        |sign, m| witness::exit(&tree, &[(0, false, sign(&example::key(210)))], m),
+    )
+    .unwrap();
+    let first_tx = example::finish(&first, &example::oracle().unwrap()).unwrap();
+    assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    wallet.checkpoint_witnessed(&first_tx).unwrap();
+    assert_eq!(first_tx.output[1], example::payout(&alice));
+    // The wallet process disappears after authorization, before confirmation.
+    drop(wallet);
+
+    let mut wallet = LockedLineage::open(&path).unwrap();
+    assert_eq!(wallet.permit(&first_tx).unwrap(), first_tx.compute_txid());
+    assert_eq!(wallet.state().witnessed_candidate(), Some(&first_tx));
+    let (saved_before, saved_successor, saved_unsigned) =
+        wallet.state().saved_pending().unwrap().unwrap();
+    assert_eq!(saved_before.root(), tree.root());
+    assert_eq!(saved_successor.root(), first.next.root());
+    assert_eq!(saved_unsigned.compute_txid(), first_tx.compute_txid());
+    assert!(example::prepare_step_reserved(
+        &contract,
+        &tree,
+        principal(&contract, &tree, 97),
+        Transition::Exit { count: 1 },
+        vec![example::payout(&alice)],
+        0,
+        98,
+        &mut wallet,
+        |sign, m| witness::exit(&tree, &[(0, false, sign(&example::key(210)))], m),
+    )
+    .is_err());
+    // A real coordinator must check the confirmed txid with Bitcoin Core.
+    // We model that authenticated notification here.
+    wallet.confirm_saved(first_tx.compute_txid()).unwrap();
+
+    let second_coin = successor(&first_tx);
+    let second = example::prepare_step_reserved(
+        &contract,
+        &saved_successor,
+        second_coin,
+        Transition::Exit { count: 1 },
+        vec![example::payout(&bob)],
+        0,
+        99,
+        &mut wallet,
+        |sign, m| witness::exit(&saved_successor, &[(1, false, sign(&example::key(211)))], m),
+    )
+    .unwrap();
+    let second_tx = example::finish(&second, &example::oracle().unwrap()).unwrap();
+    assert_eq!(wallet.permit(&second_tx).unwrap(), second_tx.compute_txid());
+    wallet.checkpoint_witnessed(&second_tx).unwrap();
+    assert_eq!(second_tx.output[1], example::payout(&bob));
+    wallet.confirm_saved(second_tx.compute_txid()).unwrap();
+    assert_eq!(wallet.state().root(), Node::empty(2));
+    assert!(wallet.state().pending().is_none());
+    drop(wallet);
+
+    let restored = LockedLineage::open(&path).unwrap();
+    assert_eq!(restored.state().root(), Node::empty(2));
+    assert_eq!(restored.state().guard().historical_identities(), 2);
+    drop(restored);
+    std::fs::remove_file(&path).unwrap();
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    std::fs::remove_file(std::path::PathBuf::from(lock)).unwrap();
+}
+
+#[test]
+fn signing_failure_after_fsync_leaves_a_sticky_reservation() {
+    use sapio_contrib::contracts::layertree::{LineageJournal, LockedLineage};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let contract = example::contract().unwrap();
+    let tree = example::initial_tree().unwrap();
+    let coin = principal(&contract, &tree, 102);
+    let compiled = example::compile(&contract, &tree).unwrap();
+    let script_root = sapio_contrib::contracts::layertree::script_tree_root(&compiled).unwrap();
+    let journal =
+        LineageJournal::bootstrap(contract.config().tree_id, script_root, coin.outpoint, &tree)
+            .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "layertree-crash-reserve-{}-{}.json",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut wallet = LockedLineage::create(&path, journal).unwrap();
+    let attempted = example::prepare_step_reserved(
+        &contract,
+        &tree,
+        coin,
+        Transition::Exit { count: 1 },
+        vec![example::payout(tree.leaf(2).unwrap())],
+        0,
+        103,
+        &mut wallet,
+        |sign, m| {
+            let owner_sig = sign(&example::key(212));
+            if !owner_sig.is_empty() {
+                return Err("synthetic signer crashed after journal fsync");
+            }
+            witness::exit(&tree, &[(2, false, owner_sig)], m)
+        },
+    );
+    assert!(attempted.is_err());
+    let pending = wallet.state().pending().cloned().unwrap();
+    drop(wallet);
+
+    let recovered = LockedLineage::open(&path).unwrap();
+    assert_eq!(recovered.state().pending(), Some(&pending));
+    assert_eq!(recovered.state().root(), tree.root());
+    let (saved_before, saved_next, unsigned) =
+        recovered.state().saved_pending().unwrap().unwrap();
+    assert_eq!(saved_before.root(), tree.root());
+    assert_eq!(saved_next.root(), pending.after);
+    assert_eq!(unsigned.compute_txid(), pending.txid);
+    drop(recovered);
+    std::fs::remove_file(&path).unwrap();
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    std::fs::remove_file(std::path::PathBuf::from(lock)).unwrap();
+}
+
+#[test]
 fn final_member_exit_closes_the_pool_and_depth_sixteen_remains_executable() {
     for depth in [1, 16] {
         let contract = LayerTree::new(
