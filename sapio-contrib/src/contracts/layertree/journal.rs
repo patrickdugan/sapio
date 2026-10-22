@@ -31,6 +31,10 @@ fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, reason)
 }
 
+fn invalid_data(error: serde_json::Error) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, error)
+}
+
 /// Exact unsigned Bitcoin transaction committed before releasing any signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SigningReservation {
@@ -226,7 +230,7 @@ fn lock_path(path: &Path) -> PathBuf {
 /// The caller must own the per-path exclusive file lock for the whole signing
 /// operation. Local file atomics do not authenticate a malicious disk snapshot.
 fn persist(path: &Path, state: &LineageJournal) -> io::Result<()> {
-    let encoded = serde_json::to_vec(state)?;
+    let encoded = serde_json::to_vec(state).map_err(|error| invalid_data(error))?;
     let stage = staging_path(path);
     let result = (|| {
         let mut opts = OpenOptions::new();
@@ -307,7 +311,8 @@ impl LockedLineage {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let lock = Self::acquire(&path)?;
-        let state: LineageJournal = serde_json::from_slice(&fs::read(&path)?)?;
+        let state: LineageJournal = serde_json::from_slice(&fs::read(&path)?)
+            .map_err(invalid_data)?;
         if state.version != JOURNAL_VERSION {
             return Err(invalid("unsupported LayerTree journal version"));
         }
