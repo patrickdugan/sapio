@@ -272,7 +272,13 @@ services are stopped, invokes the actual merged-bundle auditor with
 `--two-holder`, and signs separate PSBT redemptions using Bitcoin Core
 wallets `alice-recovered` and `bob-recovered` with their own keys.
 A single regtest block confirms both spends. The saved audit is explicitly
-**pre-spend** and the redemption receipt is **post-spend**.
+**pre-spend** and the redemption receipt is **post-spend**. Its
+`confirmed-p2a-fee-children.json` evidence records each claim wtxid,
+the confirmed fee child, the external funding outpoints, and the mining
+fee deducted from those external inputs. The signing service's fixed
+loopback ports must be unreachable after shutdown. Before each wallet
+redemption, the Python runner rechecks the current chain's witness hash
+and required confirmation depth against the saved signed recovery.
 
 The pinned upstream fixture uses a **local-dev TEE**, meaning no
 hardware-attestation assurance is claimed. This initial two-holder test
