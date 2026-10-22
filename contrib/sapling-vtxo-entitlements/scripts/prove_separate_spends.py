@@ -215,7 +215,9 @@ def main():
     parser.add_argument("--datadir")
     parser.add_argument("--wallet", action="append", default=[], help="holder=bitcoin-core-wallet-name")
     parser.add_argument("--destination", action="append", default=[], help="holder=regtest-Bitcoin-address")
-    parser.add_argument("--mine-wallet", help="mining-only wallet name")
+    mine = parser.add_mutually_exclusive_group()
+    mine.add_argument("--mine-wallet", help="mining-only wallet name")
+    mine.add_argument("--mine-address", help="preselected regtest address for mining the confirmation block")
     parser.add_argument("--fee-rate", type=float, default=2.0, help="sat/vB for each holder's spend")
     parser.add_argument("--max-fee-sats", type=int, default=2_000)
     parser.add_argument("--broadcast", action="store_true", help="spend two payouts and mine a regtest block")
@@ -227,8 +229,8 @@ def main():
     labels = {receipt["holder"] for receipt in receipts}
     if set(wallets) != labels or len(set(wallets.values())) != 2:
         raise ValueError("specify two distinct Bitcoin Core wallets, one per proven holder")
-    if args.broadcast and (set(destinations) != labels or not args.mine_wallet):
-        raise ValueError("--broadcast needs a redemption destination per holder and --mine-wallet")
+    if args.broadcast and (set(destinations) != labels or not (args.mine_wallet or args.mine_address)):
+        raise ValueError("--broadcast needs a redemption address per holder and a miner wallet or address")
     if args.fee_rate < 1 or args.fee_rate > 100 or args.max_fee_sats < 1:
         raise ValueError("unsafe or invalid regtest fee policy")
 
@@ -257,7 +259,9 @@ def main():
             if sent_txid.lower() != item["txid"].lower():
                 raise ValueError("Bitcoin Core accepted a different signed redemption")
             del item["raw_transaction"]
-        miner_address = node.call("getnewaddress", wallet=args.mine_wallet)
+        miner_address = args.mine_address or node.call("getnewaddress", wallet=args.mine_wallet)
+        if node.call("validateaddress", miner_address).get("isvalid") is not True:
+            raise ValueError("invalid regtest mining address")
         node.call("generatetoaddress", 1, miner_address)
         for item in prepared:
             mined = node.call("getrawtransaction", item["txid"], "true")
