@@ -5,6 +5,11 @@
 set -euo pipefail
 
 PIN=b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
+TEST_FILTER="${1:-sapio_real_two_holder_offline_recovery}"
+case "$TEST_FILTER" in
+    sapio_real_two_holder_offline_recovery|sapio_real_common_anchor_two_holder_recovery) ;;
+    *) echo "Unknown two-holder fixture test: $TEST_FILTER" >&2; exit 1 ;;
+esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 MANIFEST="$REPO/contrib/sapling-vtxo-entitlements/Cargo.toml"
@@ -75,7 +80,7 @@ cd "$WORKTREE"
 
 # The upstream recipe validates real-service dependencies and creates a
 # private network namespace if the platform supports bubblewrap isolation.
-./contrib/sapio-e2e.sh sapio_real_two_holder_offline_recovery
+./contrib/sapio-e2e.sh "$TEST_FILTER"
 
 test -s "$CAPTURE_DIR/two-holder-pre-spend-report.json"
 test -s "$CAPTURE_DIR/two-holder-redemptions.json"
