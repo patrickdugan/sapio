@@ -12,6 +12,7 @@
 //! established by this offline report.
 
 pub mod chain;
+pub mod two_holder;
 
 use anyhow::{Context, Result, bail, ensure};
 use bitcoin::{Network, OutPoint, TxOut};
