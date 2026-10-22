@@ -41,7 +41,10 @@ fn combine(
     alice: ProgramRecoveryBundle,
     bob: ProgramRecoveryBundle,
 ) -> Result<ProgramRecoveryBundle> {
-    ensure!(alice.version == bob.version, "recovery export version mismatch");
+    ensure!(
+        alice.version == bob.version,
+        "recovery export version mismatch"
+    );
     ensure!(alice.network == bob.network, "recovery network mismatch");
     ensure!(
         alice.targets.len() == 1 && bob.targets.len() == 1,
@@ -116,9 +119,11 @@ fn main() -> Result<()> {
     .context("decoding independently attested payout terms")?;
     ensure!(
         terms.targets.len() == 2
-            && terms.targets.iter().all(|target| target.beneficiaries.len() == 1)
-            && terms.targets[0].beneficiaries[0].holder
-                != terms.targets[1].beneficiaries[0].holder,
+            && terms
+                .targets
+                .iter()
+                .all(|target| target.beneficiaries.len() == 1)
+            && terms.targets[0].beneficiaries[0].holder != terms.targets[1].beneficiaries[0].holder,
         "two independent recovery terms, each naming one different holder, are required"
     );
     let alice = read_bundle(&alice_path)?;
