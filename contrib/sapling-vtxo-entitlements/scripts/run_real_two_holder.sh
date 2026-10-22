@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 MANIFEST="$REPO/contrib/sapling-vtxo-entitlements/Cargo.toml"
 UPSTREAM="${SAPLINGOS_CHECKOUT:?Set SAPLINGOS_CHECKOUT to a local Git checkout containing the pinned SaplingOS commit}"
-CAPTURE_DIR="${SAPLING_TWO_HOLDER_CAPTURE_DIR:-$REPO/test/real-two-holder}"
+CAPTURE_DIR="${SAPLING_TWO_HOLDER_CAPTURE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/sapling-vtxo-two-holder/$(date +%Y%m%d-%H%M%S)-$}"
 BITCOIN_CLI="${SAPLING_TWO_HOLDER_BITCOIN_CLI:-$(command -v bitcoin-cli || true)}"
 
 if [[ "$UPSTREAM" != /* ]] || ! git -C "$UPSTREAM" cat-file -e "$PIN^{commit}" 2>/dev/null; then
