@@ -366,9 +366,10 @@ mod tests {
     #[test]
     fn rejects_fabricated_extra_payout() {
         let (terms, mut report) = pair();
+        let reused = report.targets[0].payouts[0].outpoint.clone();
         report.targets[0].payouts.push(ConfirmedPayout {
             holder: "mallory".into(),
-            outpoint: report.targets[0].payouts[0].outpoint.clone(),
+            outpoint: reused,
             sats: 1,
             unspent_at_tip: true,
         });
