@@ -120,14 +120,14 @@ pub fn verify_two_holder(terms: &Terms, chain: &ChainReport) -> Result<TwoHolder
             receipt.unspent_at_tip,
             "a holder payout was already spent at the observed chain tip"
         );
-        let script = hex::decode(&beneficiary.script_pubkey_hex)
-            .context("invalid holder payout script")?;
+        let script =
+            hex::decode(&beneficiary.script_pubkey_hex).context("invalid holder payout script")?;
         ensure!(
             !script.is_empty() && used_scripts.insert(script.clone()),
             "two holders use the same payout script"
         );
-        let paid = OutPoint::from_str(&receipt.outpoint)
-            .context("invalid confirmed payout outpoint")?;
+        let paid =
+            OutPoint::from_str(&receipt.outpoint).context("invalid confirmed payout outpoint")?;
         ensure!(
             paid.txid == Txid::from_str(&observed.claim_txid)?,
             "holder payout belongs to another claim transaction"
@@ -140,24 +140,32 @@ pub fn verify_two_holder(terms: &Terms, chain: &ChainReport) -> Result<TwoHolder
             .checked_add(beneficiary.sats)
             .context("two-holder total overflows satoshi range")?;
         ensure!(
-            holders.insert(
-                beneficiary.holder.clone(),
-                HolderReceipt {
-                    holder: beneficiary.holder.clone(),
-                    controlled_outpoint: target.outpoint.clone(),
-                    confirmed_claim_txid: observed.claim_txid.clone(),
-                    payout_outpoint: paid.to_string(),
-                    script_pubkey_hex: hex::encode(script),
-                    sats: receipt.sats,
-                    confirmations: observed.confirmations,
-                    unspent_at_tip: true,
-                }
-            ).is_none(),
+            holders
+                .insert(
+                    beneficiary.holder.clone(),
+                    HolderReceipt {
+                        holder: beneficiary.holder.clone(),
+                        controlled_outpoint: target.outpoint.clone(),
+                        confirmed_claim_txid: observed.claim_txid.clone(),
+                        payout_outpoint: paid.to_string(),
+                        script_pubkey_hex: hex::encode(script),
+                        sats: receipt.sats,
+                        confirmations: observed.confirmations,
+                        unspent_at_tip: true,
+                    }
+                )
+                .is_none(),
             "two recovery positions name the same beneficiary"
         );
     }
-    ensure!(by_target.is_empty(), "unexpected additional confirmed recovery");
-    ensure!(holders.len() == 2, "two distinct beneficiaries are required");
+    ensure!(
+        by_target.is_empty(),
+        "unexpected additional confirmed recovery"
+    );
+    ensure!(
+        holders.len() == 2,
+        "two distinct beneficiaries are required"
+    );
 
     Ok(TwoHolderReport {
         network: expected_network.into(),
@@ -189,7 +197,10 @@ mod tests {
             Ok("regtest".into())
         }
         fn transaction(&self, txid: Txid) -> Result<ObservedTransaction> {
-            self.transactions.get(&txid).cloned().context("missing recovery")
+            self.transactions
+                .get(&txid)
+                .cloned()
+                .context("missing recovery")
         }
         fn unspent(&self, point: OutPoint, _: &ScriptBuf) -> Result<bool> {
             Ok(self.unspent.contains(&point))
@@ -209,13 +220,11 @@ mod tests {
         let mut transactions = HashMap::new();
         let mut unspent = HashSet::new();
         let mut claims = Vec::new();
-        for (i, (holder, amount, key_byte)) in
-            [("alice", 60_000, 1u8), ("bob", 40_000, 2u8)].into_iter().enumerate()
+        for (i, (holder, amount, key_byte)) in [("alice", 60_000, 1u8), ("bob", 40_000, 2u8)]
+            .into_iter()
+            .enumerate()
         {
-            let controlled = OutPoint::new(
-                Txid::from_str(&format!("{:064x}", i + 1)).unwrap(),
-                0,
-            );
+            let controlled = OutPoint::new(Txid::from_str(&format!("{:064x}", i + 1)).unwrap(), 0);
             let beneficiary = Beneficiary {
                 holder: holder.into(),
                 script_pubkey_hex: script(key_byte),
@@ -262,12 +271,14 @@ mod tests {
                 beneficiaries: vec![beneficiary],
             });
         }
-        let fake = ConfirmedFakeChain { transactions, unspent };
+        let fake = ConfirmedFakeChain {
+            transactions,
+            unspent,
+        };
         let targets = claims
             .iter()
             .map(|(point, claim, b)| {
-                verify_confirmed_claim(&fake, claim, std::slice::from_ref(b), *point, 6)
-                    .unwrap()
+                verify_confirmed_claim(&fake, claim, std::slice::from_ref(b), *point, 6).unwrap()
             })
             .collect();
         (
