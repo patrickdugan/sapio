@@ -184,6 +184,8 @@ pub struct ConfirmedTarget {
     pub controlled_outpoint: String,
     /// Exact saved and confirmed recovery transaction ID.
     pub claim_txid: String,
+    /// Witness transaction ID, binding the complete saved witness data.
+    pub claim_wtxid: String,
     /// Active-chain confirmation count at observation.
     pub confirmations: u64,
     /// Payouts whose scripts were independently authenticated offline.
@@ -274,6 +276,7 @@ pub fn verify_confirmed_claim(
     Ok(ConfirmedTarget {
         controlled_outpoint: controlled.to_string(),
         claim_txid: txid.to_string(),
+        claim_wtxid: claim.compute_wtxid().to_string(),
         confirmations: onchain.confirmations,
         payouts,
     })
