@@ -1,0 +1,51 @@
+name: SaplingOS pinned two-holder integration compile
+
+on:
+  pull_request:
+    paths:
+      - "contrib/sapling-vtxo-entitlements/e2e/**"
+      - "contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh"
+      - ".github/workflows/sapling-two-holder-compile.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-sdk-test-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: sapio-fork
+      - uses: actions/checkout@v7
+        with:
+          repository: stutxo/saplingos
+          ref: b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
+          path: saplingos
+      - name: Install C and Bitcoin-consensus build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             clang libclang-dev libssl-dev libsqlite3-dev pkg-config             protobuf-compiler cmake libboost-all-dev libpq-dev
+      - name: Attach real two-holder test to pinned SaplingOS test module
+        run: |
+          cp sapio-fork/contrib/sapling-vtxo-entitlements/e2e/sapio_two_holder.rs             saplingos/testing/tests/sdk/sapio/two_holder.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          parent = Path("saplingos/testing/tests/sdk/sapio.rs")
+          text = parent.read_text()
+          marker = "mod process;\n"
+          assert text.count(marker) == 1, "pinned integration module changed"
+          parent.write_text(text.replace(marker, marker + "mod two_holder;\n"))
+          PY
+          test "$(git -C saplingos rev-parse HEAD)" =             "b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d"
+      - name: Select pinned toolchain
+        working-directory: saplingos
+        run: rustup show
+      - name: Typecheck real Ark/Sapio/Bitcoin integration test without starting services
+        working-directory: saplingos
+        run: |
+          cargo check --locked -p sapling-testing             --features sapio-integration --test sapling-sdk
