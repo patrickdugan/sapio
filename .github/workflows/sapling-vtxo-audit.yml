@@ -34,6 +34,7 @@ jobs:
         run: |
           bash -n contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
           bash -n contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh
+          bash -n contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh
       - name: Test independent-wallet recovery evidence runner
         run: python3 -m unittest discover -s contrib/sapling-vtxo-entitlements/scripts -p 'test_*.py'
       - name: Lint the standalone verifier
