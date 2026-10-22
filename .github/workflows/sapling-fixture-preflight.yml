@@ -1,0 +1,80 @@
+name: SaplingOS regtest fixture supply-chain preflight
+
+# Fast source/asset provenance gate. Building and executing the actual
+# Ark/Sapio service-shutdown recovery requires the separately provisioned
+# x86_64 native fixture host described in the README.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sapling-fixture-preflight.yml"
+      - "contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh"
+      - "contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: sapio-fork
+      - uses: actions/checkout@v7
+        with:
+          repository: stutxo/saplingos
+          ref: b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
+          fetch-depth: 4
+          path: saplingos
+      - uses: actions/checkout@v7
+        with:
+          repository: ark-bitcoin/bark
+          ref: 626c9b241dd25d73212915d8fca959ab5e3b8f1f
+          path: bark
+      - uses: actions/checkout@v7
+        with:
+          repository: stutxo/sapio_tee
+          ref: f083bdbd2343aad22fab861f1565c0f2c2e6b0af
+          path: tee
+      - uses: actions/checkout@v7
+        with:
+          repository: BoltzExchange/hold
+          ref: af0055b132f3b9f24d0b1d478a15005fcf8f014f
+          path: hold
+
+      - name: Verify pinned source relationship, binaries and bootstrap syntax
+        run: |
+          set -euo pipefail
+          test "$(git -C saplingos rev-parse HEAD)" = b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
+          test "$(git -C bark rev-parse HEAD)" = 626c9b241dd25d73212915d8fca959ab5e3b8f1f
+          test "$(git -C tee rev-parse HEAD)" = f083bdbd2343aad22fab861f1565c0f2c2e6b0af
+          test "$(git -C hold rev-parse HEAD)" = af0055b132f3b9f24d0b1d478a15005fcf8f014f
+          git -C saplingos merge-base --is-ancestor 758f7b730 b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
+          test -f bark/server/src/bin/captaind/main.rs
+          test -f bark/server/src/bin/watchmand/main.rs
+          test -f hold/Cargo.lock
+          python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          cargo = tomllib.loads(Path("tee/Cargo.toml").read_text())
+          assert cargo["dependencies"]["ark-lib"]["rev"] == "758f7b730"
+          assert "local-dev" in cargo["features"]
+          PY
+          test -s tee/examples/templatehash/templatehash.wasm
+          echo "0fbc4e2cc68722474e3a708ffb934c0784990806ea1fb4a3dda64805fdd340a1  tee/examples/templatehash/templatehash.wasm" | sha256sum -c -
+          bash -n sapio-fork/contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh
+          bash -n sapio-fork/contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh
+
+      - name: Check official Core Lightning Ubuntu release contents
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSLo cln.tar.xz \
+            https://github.com/ElementsProject/lightning/releases/download/v26.06.7/clightning-v26.06.7-Ubuntu-24.04-amd64.tar.xz
+          echo "b09f4ed81628d4d60d9f9096f85dcae9533290f3ed409097e95f8d7414acd9c8  cln.tar.xz" | sha256sum -c -
+          mkdir -p cln
+          tar -xJf cln.tar.xz -C cln
+          test -n "$(find cln -name lightningd -type f -print -quit)"
+          test -n "$(find cln -name cln-grpc -print -quit)"
+          echo "Official pinned Core Lightning and gRPC binaries are present."
