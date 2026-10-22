@@ -63,6 +63,7 @@ def validate_report(report):
         name = holder["holder"]
         controlled = holder["controlled_outpoint"]
         claim_txid = holder["confirmed_claim_txid"]
+        claim_wtxid = holder["confirmed_claim_wtxid"]
         payout = holder["payout_outpoint"]
         txid, _ = one_outpoint(payout)
         amount = holder["sats"]
@@ -80,6 +81,8 @@ def validate_report(report):
         outpoints.add(payout)
         if claim_txid.lower() != txid or claim_txid in claims:
             raise ValueError("two claims must have independent Bitcoin transaction IDs")
+        if len(claim_wtxid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in claim_wtxid):
+            raise ValueError("invalid signed witness transaction ID")
         claims.add(claim_txid)
         if controlled not in by_controlled or not holder["unspent_at_tip"]:
             raise ValueError("missing unspent payout for selected VTXO")
@@ -87,6 +90,9 @@ def validate_report(report):
         expected = by_offline[controlled]
         if chain_target["claim_txid"] != claim_txid or expected["claim_txid"] != claim_txid:
             raise ValueError("confirmed claim differs from the saved recovery")
+        if (chain_target["claim_wtxid"].lower() != claim_wtxid.lower()
+                or expected["claim_wtxid"].lower() != claim_wtxid.lower()):
+            raise ValueError("confirmed signed witness differs from the saved recovery")
         if len(chain_target["payouts"]) != 1 or chain_target["payouts"][0] != {
             "holder": name,
             "outpoint": payout,
@@ -125,7 +131,7 @@ class BitcoinCli:
             return raw
 
 
-def wallet_owns_payout(node, receipt, wallet):
+def wallet_owns_payout(node, receipt, wallet, min_confirmations=1):
     txid, vout = one_outpoint(receipt["payout_outpoint"])
     value = node.call("gettxout", txid, vout, "false")
     if value is None:
@@ -138,8 +144,10 @@ def wallet_owns_payout(node, receipt, wallet):
     confirmed = node.call("getrawtransaction", txid, "true")
     if confirmed["txid"].lower() != txid:
         raise ValueError("Bitcoin Core returned a different confirmed transaction")
-    if not isinstance(confirmed.get("confirmations"), int) or confirmed["confirmations"] < 1:
-        raise ValueError("payout transaction is no longer confirmed")
+    if confirmed["hash"].lower() != receipt["confirmed_claim_wtxid"].lower():
+        raise ValueError("confirmed witness transaction changed after offline audit")
+    if not isinstance(confirmed.get("confirmations"), int) or confirmed["confirmations"] < min_confirmations:
+        raise ValueError("payout transaction no longer meets confirmation policy")
 
     coins = node.call("listunspent", 1, 9999999, wallet=wallet)
     matched = [
@@ -223,7 +231,9 @@ def main():
     parser.add_argument("--broadcast", action="store_true", help="spend two payouts and mine a regtest block")
     args = parser.parse_args()
     with open(args.report, encoding="utf-8") as f:
-        receipts = validate_report(json.load(f))
+        report = json.load(f)
+    receipts = validate_report(report)
+    chain_depth = report["chain"]["minimum_confirmations"]
     wallets = keyed_pairs(args.wallet)
     destinations = keyed_pairs(args.destination)
     labels = {receipt["holder"] for receipt in receipts}
@@ -240,7 +250,7 @@ def main():
         raise ValueError("requires a synced, trusted Bitcoin Core regtest node")
 
     for receipt in receipts:
-        wallet_owns_payout(node, receipt, wallets[receipt["holder"]])
+        wallet_owns_payout(node, receipt, wallets[receipt["holder"]], chain_depth)
     result = {
         "network": "regtest",
         "holder_wallets_verified_spendable": True,
