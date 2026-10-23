@@ -32,7 +32,23 @@ fn new_recipient_wallet(ctx: &TestContext, name: &str) -> (Client, ScriptBuf) {
         .unwrap()
         .require_network(Network::Regtest)
         .unwrap();
+    set_recipient_wallets_loaded(ctx, &[name], false);
     (client, address.script_pubkey())
+}
+
+/// The shared fixture node funds SDK wallets and derives addresses through
+/// its default wallet on the bare RPC path, which Bitcoin Core refuses while
+/// a second wallet is loaded ("Multiple wallets are loaded"). Keep each
+/// holder's separate descriptor wallet unloaded except while it signs its
+/// own redemption; loading resynchronises it to the tip, so it still sees
+/// the recovered payout to the address it issued before the outage.
+fn set_recipient_wallets_loaded(ctx: &TestContext, names: &[&str], loaded: bool) {
+    let general = ctx.bitcoind().sync_client();
+    let method = if loaded { "loadwallet" } else { "unloadwallet" };
+    for name in names {
+        let _: serde_json::Value = general.call(method, &[json!(name)])
+            .unwrap_or_else(|error| panic!("{method} {name}: {error}"));
+    }
 }
 
 fn script_hex(script: &ScriptBuf) -> String {
@@ -673,9 +689,10 @@ async fn sapio_real_two_holder_offline_recovery() {
     // The separate recipient wallets now sign PSBTs, spending only their
     // corresponding payouts. Python checks each recovered outpoint exactly,
     // puts a strict upper bound on fees, and mines both spends on regtest.
+    let mine_addr = ctx.bitcoind().get_new_address().to_string();
+    set_recipient_wallets_loaded(&ctx, &["alice-recovered", "bob-recovered"], true);
     let dest_a: String = alice_recipient.call("getnewaddress", &[]).unwrap();
     let dest_b: String = bob_recipient.call("getnewaddress", &[]).unwrap();
-    let mine_addr = ctx.bitcoind().get_new_address().to_string();
     let dest_a = format!("alice={dest_a}");
     let dest_b = format!("bob={dest_b}");
     let spend = run_fixture_executable(Path::new("/usr/bin/env"), &[
@@ -691,6 +708,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     ]);
     let receipt: serde_json::Value = serde_json::from_slice(&spend.stdout)
         .expect("independent-wallet redemption output was invalid JSON");
+    set_recipient_wallets_loaded(&ctx, &["alice-recovered", "bob-recovered"], false);
     assert_eq!(receipt["independent_spends_confirmed"], true);
     assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
     save_json(&artifact_dir.join("two-holder-redemptions.json"), &receipt);
@@ -950,9 +968,10 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     });
     save_json(&dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
 
+    let mine_addr = ctx.bitcoind().get_new_address().to_string();
+    set_recipient_wallets_loaded(&ctx, &["alice-recovered", "bob-recovered"], true);
     let alice_dest: String = alice_core.call("getnewaddress", &[]).unwrap();
     let bob_dest: String = bob_core.call("getnewaddress", &[]).unwrap();
-    let mine_addr = ctx.bitcoind().get_new_address().to_string();
     let alice_arg = format!("alice={alice_dest}");
     let bob_arg = format!("bob={bob_dest}");
     let redemption = run_fixture_executable(Path::new("/usr/bin/env"), &[
@@ -967,6 +986,7 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         std::ffi::OsStr::new("--broadcast"),
     ]);
     let receipt: serde_json::Value = serde_json::from_slice(&redemption.stdout).unwrap();
+    set_recipient_wallets_loaded(&ctx, &["alice-recovered", "bob-recovered"], false);
     assert_eq!(receipt["independent_spends_confirmed"], true);
     assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
     // Each Bitcoin Core wallet spent exactly its own recovered payout in a
