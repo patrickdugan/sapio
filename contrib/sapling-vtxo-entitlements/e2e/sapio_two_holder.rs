@@ -51,6 +51,32 @@ fn set_recipient_wallets_loaded(ctx: &TestContext, names: &[&str], loaded: bool)
     }
 }
 
+/// The holder's own wallet key U for an agreed program position. A program
+/// VTXO is locked to KeyAgg(U, C), not to U, while the independent terms pin
+/// U (`ProgramKey::user_pubkey`). The holder derives U from its own seed on
+/// the wallet's m/350'/0'/i branch and checks that, under the agreed program
+/// and signer root, it yields the live VTXO key. Nothing is read from the
+/// recovery export the terms will later be checked against.
+fn holder_user_pubkey(
+    mnemonic: &bip39::Mnemonic,
+    root: bitcoin::bip32::Xpub,
+    program: &Program,
+    vtxo_key: bitcoin::secp256k1::PublicKey,
+) -> bitcoin::secp256k1::PublicKey {
+    let master = Xpriv::new_master(Network::Regtest, &mnemonic.to_seed("")).unwrap();
+    let branch = master.derive_priv(&ark::SECP, &[
+        ChildNumber::from_hardened_idx(350).unwrap(),
+        ChildNumber::from_hardened_idx(0).unwrap(),
+    ]).unwrap();
+    (0..128).map(|index| {
+        branch.derive_priv(&ark::SECP, &[ChildNumber::from_normal_idx(index).unwrap()])
+            .unwrap().to_keypair(&ark::SECP).public_key()
+    }).find(|user| {
+        ProgramKey { root, program: program.clone(), user_pubkey: *user }
+            .public_key().ok() == Some(vtxo_key)
+    }).expect("live VTXO key is not the holder's own key under the agreed program")
+}
+
 fn script_hex(script: &ScriptBuf) -> String {
     script.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -508,6 +534,8 @@ async fn sapio_real_two_holder_offline_recovery() {
     let signer_root = tee.public_root().to_string();
     let alice_seed = bip39::Mnemonic::generate(12).unwrap();
     let bob_seed = bip39::Mnemonic::generate(12).unwrap();
+    let agreed_program = program.clone();
+    let (owner_a, owner_b) = (alice_seed.clone(), bob_seed.clone());
     assert_ne!(alice_seed.to_string(), bob_seed.to_string());
     assert_ne!(sponsor_seed.to_string(), alice_seed.to_string());
     assert_ne!(sponsor_seed.to_string(), bob_seed.to_string());
@@ -550,7 +578,8 @@ async fn sapio_real_two_holder_offline_recovery() {
                 "program": {
                     "program_id": program_id,
                     "signer_root": signer_root,
-                    "user_pubkey": alice_positions[0].vtxo.user_pubkey().to_string()
+                    "user_pubkey": holder_user_pubkey(&owner_a, tee.public_root(), &agreed_program,
+                        alice_positions[0].vtxo.user_pubkey()).to_string()
                 },
                 "beneficiaries": [
                     {"holder": "alice", "script_pubkey_hex": script_hex(&alice_script), "sats": 60000}
@@ -561,7 +590,8 @@ async fn sapio_real_two_holder_offline_recovery() {
                 "program": {
                     "program_id": program_id,
                     "signer_root": signer_root,
-                    "user_pubkey": bob_positions[0].vtxo.user_pubkey().to_string()
+                    "user_pubkey": holder_user_pubkey(&owner_b, tee.public_root(), &agreed_program,
+                        bob_positions[0].vtxo.user_pubkey()).to_string()
                 },
                 "beneficiaries": [
                     {"holder": "bob", "script_pubkey_hex": script_hex(&bob_script), "sats": 40000}
@@ -759,6 +789,8 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let signer_root = tee.public_root().to_string();
     let seed_a = bip39::Mnemonic::generate(12).unwrap();
     let seed_b = bip39::Mnemonic::generate(12).unwrap();
+    let agreed_program = program.clone();
+    let (owner_a, owner_b) = (seed_a.clone(), seed_b.clone());
     assert_ne!(seed_a.to_string(), seed_b.to_string());
     assert_ne!(sponsor_seed.to_string(), seed_a.to_string());
     assert_ne!(sponsor_seed.to_string(), seed_b.to_string());
@@ -808,7 +840,8 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
                 "program":{
                     "program_id":program_id.clone(),
                     "signer_root":signer_root.clone(),
-                    "user_pubkey":alice_positions[0].vtxo.user_pubkey().to_string()
+                    "user_pubkey":holder_user_pubkey(&owner_a, tee.public_root(), &agreed_program,
+                        alice_positions[0].vtxo.user_pubkey()).to_string()
                 },
                 "beneficiaries":[
                     {"holder":"alice", "script_pubkey_hex":script_hex(&alice_script), "sats":60000}
@@ -819,7 +852,8 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
                 "program":{
                     "program_id":program_id,
                     "signer_root":signer_root,
-                    "user_pubkey":bob_positions[0].vtxo.user_pubkey().to_string()
+                    "user_pubkey":holder_user_pubkey(&owner_b, tee.public_root(), &agreed_program,
+                        bob_positions[0].vtxo.user_pubkey()).to_string()
                 },
                 "beneficiaries":[
                     {"holder":"bob", "script_pubkey_hex":script_hex(&bob_script), "sats":40000}
