@@ -94,6 +94,13 @@ jobs:
             | tee "$RUNNER_TEMP/service-exports.log"
           source <(grep '^export ' "$RUNNER_TEMP/service-exports.log")
 
+          # Prove the nested pinned Nix shell still sees the staged artifact
+          # before spending time compiling the SaplingOS integration binary.
+          nix develop --no-update-lock-file "$SAPLINGOS_CHECKOUT" -c bash -ceu '
+            [[ "${SWAGGER_UI_DOWNLOAD_URL:-}" == file:///* ]]
+            test -r "${SWAGGER_UI_DOWNLOAD_URL#file://}"
+          '
+
           # The pinned SaplingOS e2e suite starts fresh test instances itself.
           # The external wallets and signers are stopped before recovery replay.
           bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
