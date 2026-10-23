@@ -1047,6 +1047,111 @@ async fn common_anchor_fixture(stale_sender_attack: bool) {
         "sapio-tee", "captaind",
     ]);
 
+    if let Some((stale_point, stale_bundle)) = &stale_sender {
+        // Derive conflicts from *both* parties' saved Bitcoin transactions.
+        // Requiring intersecting spent outpoints eliminates imaginary races
+        // based on labels or an unrelated attacker payment.
+        let mut conflicts = Vec::new();
+        for (stale_id, stale_tx, _, _) in
+            recovery_transactions(&[("stale-sender", stale_bundle)])
+        {
+            for (honest_id, honest_tx, used_by, role) in recovery_transactions(&holders) {
+                if stale_id == honest_id { continue; }
+                for stale_input in &stale_tx.input {
+                    for honest_input in &honest_tx.input {
+                        if stale_input.previous_output == honest_input.previous_output {
+                            conflicts.push(json!({
+                                "stale_txid": stale_id.to_string(),
+                                "honest_txid": honest_id.to_string(),
+                                "conflicted_outpoint": stale_input.previous_output.to_string(),
+                                "honest_used_by": used_by,
+                                "honest_role": role,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!conflicts.is_empty(),
+            "stale owner branch never double-spent a signed Alice/Bob ancestor");
+        for name in ["alice", "bob"] {
+            assert!(conflicts.iter().any(|c| c["honest_used_by"].as_array().unwrap()
+                .iter().any(|participant| participant == name)),
+                "{name}'s recovery ancestry has no competing signed input");
+        }
+        // The real signers have stopped, and the old owner SDK has stopped.
+        // The only live signer for fees is an independently seeded Bitcoin
+        // wallet. It imports the pre-transfer fully signed sender branch,
+        // preserves its witnesses, and funds one P2A child per publication.
+        recover_offline(&ctx, "external-recovery-fees", Some(&stale_file), stale_bundle).await;
+        assert_saved_claim(&ctx, stale_bundle, *stale_point, &stale_script, sat(120_000));
+        let rpc = ctx.bitcoind().sync_client();
+        for row in &conflicts {
+            let txid: bitcoin::Txid = row["honest_txid"].as_str().unwrap().parse().unwrap();
+            assert!(rpc.get_raw_transaction(&txid, None).is_err(),
+                "conflicting honest ancestor unexpectedly confirmed: {txid}");
+        }
+        for bundle in [&bundle_a, &bundle_b] {
+            let claim = &bundle.recoveries.iter()
+                .find(|r| r.controlled_outpoint == bundle.targets[0]).unwrap().claim;
+            assert!(rpc.get_raw_transaction(&claim.compute_txid(), None).is_err(),
+                "honest holder claim unexpectedly confirmed after stale-owner win");
+        }
+        ctx.bitcoind().generate(6).await;
+        let stale_anchors = selected_recovery_anchors(&[stale_bundle]);
+        let stale_chain = confirmed_recovery_chain(
+            &ctx, &[("stale-sender", stale_bundle)],
+            shutdown_height, &sponsor_coins, &stale_anchors,
+        );
+        assert_frozen_recovery_evidence(
+            &frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes,
+        );
+
+        // The honest exports still pass static signature verification, but
+        // the existing chain-backed two-holder auditor must refuse to report
+        // a recovered pair after the stale branch spends their shared input.
+        let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER").unwrap());
+        let auditor = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_AUDITOR").unwrap());
+        let merged = dir.join("both-signed-recoveries.json");
+        run_fixture_executable(&merger, &[
+            alice_file.as_os_str(), bob_file.as_os_str(),
+            terms_file.as_os_str(), merged.as_os_str()
+        ]);
+        let cli = fixture_bitcoin_cli(&ctx);
+        let audit = std::process::Command::new(&auditor)
+            .args([
+                merged.as_os_str(), terms_file.as_os_str(),
+                std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
+                std::ffi::OsStr::new("--confirmations"), std::ffi::OsStr::new("6"),
+                std::ffi::OsStr::new("--two-holder"),
+            ])
+            .env_remove("LD_LIBRARY_PATH")
+            .output().expect("run independent adversarial receipt rejection");
+        assert!(!audit.status.success(),
+            "two-holder auditor reported success after competing signed branch won");
+        fs::remove_file(cli).unwrap();
+
+        // Private report: the public validator must re-derive its identities
+        // and conflicts from the SHA-frozen original signed exports.
+        save_json(&dir.join("stale-branch-race.json"), &json!({
+            "scenario": "stale-sender-signed-branch",
+            "bitcoin_height_at_shutdown": shutdown_height,
+            "shared_chain_anchor": anchor.to_string(),
+            "stale_sender_controlled_outpoint": stale_point.to_string(),
+            "stale_sender_claim_txid": stale_bundle.recoveries.iter()
+                .find(|r| r.controlled_outpoint == *stale_point)
+                .unwrap().claim.compute_txid().to_string(),
+            "stale_sender_claim_confirmed": true,
+            "alice_claim_confirmed": false,
+            "bob_claim_confirmed": false,
+            "external_fee_sponsor_used": true,
+            "signed_input_conflicts": conflicts,
+            "stale_recovery_transactions": stale_chain,
+            "honest_two_holder_auditor_rejected": true,
+        }));
+        return;
+    }
+
     recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
     assert!(ctx.bitcoind().sync_client().get_raw_transaction(
