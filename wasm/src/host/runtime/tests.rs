@@ -18,7 +18,8 @@ fn compiler_and_evaluator_have_separate_nonrenewable_budgets() {
 
     let mut evaluator = new_evaluator_store();
     let evaluator_module = Module::new(&evaluator, source).unwrap();
-    let evaluator_instance = Instance::new(&mut evaluator, &evaluator_module, &imports! {}).unwrap();
+    let evaluator_instance =
+        Instance::new(&mut evaluator, &evaluator_module, &imports! {}).unwrap();
     assert_eq!(
         get_remaining_points(&mut evaluator, &evaluator_instance),
         MeteringPoints::Remaining(INSTANCE_FUEL)
