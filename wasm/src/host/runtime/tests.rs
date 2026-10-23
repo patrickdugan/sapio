@@ -3,6 +3,29 @@ use wasmer::{imports, CompileError, Instance, Module, Value};
 use wasmer_middlewares::metering::{get_remaining_points, MeteringPoints};
 
 #[test]
+fn compiler_and_evaluator_have_separate_nonrenewable_budgets() {
+    assert_eq!(COMPILER_INSTANCE_FUEL, 500_000_000);
+    assert_eq!(INSTANCE_FUEL, 100_000_000);
+
+    let source = "(module (func (export \"noop\")))";
+    let mut compiler = new_store();
+    let compiler_module = Module::new(&compiler, source).unwrap();
+    let compiler_instance = Instance::new(&mut compiler, &compiler_module, &imports! {}).unwrap();
+    assert_eq!(
+        get_remaining_points(&mut compiler, &compiler_instance),
+        MeteringPoints::Remaining(COMPILER_INSTANCE_FUEL)
+    );
+
+    let mut evaluator = new_evaluator_store();
+    let evaluator_module = Module::new(&evaluator, source).unwrap();
+    let evaluator_instance = Instance::new(&mut evaluator, &evaluator_module, &imports! {}).unwrap();
+    assert_eq!(
+        get_remaining_points(&mut evaluator, &evaluator_instance),
+        MeteringPoints::Remaining(INSTANCE_FUEL)
+    );
+}
+
+#[test]
 fn evaluator_failed_growth_traps_before_guest_observation() {
     for evaluator in [false, true] {
         let mut store = if evaluator {
