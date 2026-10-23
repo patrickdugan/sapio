@@ -162,12 +162,60 @@ fn frozen_recovery_evidence(paths: &[&Path]) -> serde_json::Value {
 /// Check the original independent agreement and immutable signed exports
 /// against the bytes captured *before* signing services were stopped.
 /// Catch silent on-disk rollback, replacement, or mutation after outage.
-fn assert_frozen_recovery_evidence(paths: &[&Path], frozen: &serde_json::Value) {
+fn assert_frozen_recovery_evidence(paths: &[&Path], frozen: &serde_json::Value, manifest: &Path) {
     assert_eq!(
         &frozen_recovery_evidence(paths),
         frozen,
         "independent terms or signed recovery export changed after service shutdown"
     );
+    let recorded: serde_json::Value = serde_json::from_slice(
+        &fs::read(manifest).expect("read pre-shutdown frozen-evidence manifest"),
+    ).expect("parse pre-shutdown frozen-evidence manifest");
+    assert_eq!(&recorded, frozen, "frozen-evidence manifest changed after shutdown");
+}
+
+#[test]
+fn frozen_evidence_guard_rejects_substitution_and_manifest_rewrites() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("sapling-freeze-{}-{nonce}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let terms = dir.join("two-holder-terms.json");
+    let alice = dir.join("alice-recovery.json");
+    let bob = dir.join("bob-recovery.json");
+    for (path, value) in [
+        (&terms, "independent-agreement"),
+        (&alice, "signed-alice"),
+        (&bob, "signed-bob"),
+    ] {
+        save_json(path, &json!({"synthetic": value}));
+    }
+    let paths = [terms.as_path(), alice.as_path(), bob.as_path()];
+    let frozen = frozen_recovery_evidence(&paths);
+    let manifest = dir.join("frozen-evidence-before-shutdown.json");
+    save_json(&manifest, &frozen);
+    assert_frozen_recovery_evidence(&paths, &frozen, &manifest);
+
+    for path in &paths {
+        let original = fs::read(path).unwrap();
+        fs::write(path, b"{\"synthetic\":\"altered\"}\n").unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_frozen_recovery_evidence(&paths, &frozen, &manifest)
+            }).is_err(),
+            "substituted original file unexpectedly passed frozen-evidence check"
+        );
+        fs::write(path, original).unwrap();
+        assert_frozen_recovery_evidence(&paths, &frozen, &manifest);
+    }
+    fs::write(&manifest, b"{\"schema\":1,\"files\":[]}\n").unwrap();
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_frozen_recovery_evidence(&paths, &frozen, &manifest)
+        }).is_err(),
+        "rewritten evidence manifest unexpectedly passed frozen-evidence check"
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 fn assert_saved_claim(
@@ -410,7 +458,8 @@ async fn sapio_real_two_holder_offline_recovery() {
         terms_file.as_path(), alice_file.as_path(), bob_file.as_path(),
     ];
     let frozen = frozen_recovery_evidence(&frozen_paths);
-    save_json(&artifact_dir.join("frozen-evidence-before-shutdown.json"), &frozen);
+    let frozen_manifest = artifact_dir.join("frozen-evidence-before-shutdown.json");
+    save_json(&frozen_manifest, &frozen);
 
     // The Ark service and Sapio signing service now disappear. From this
     // point on each claimant reopens solely its persisted seed and unsigned/
@@ -423,6 +472,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     drop(bob);
     tee.stop().await.unwrap();
     srv.stop().await.unwrap();
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err(),
         "Sapio local-dev signing API still answers after shutdown");
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
@@ -439,8 +489,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     recover_offline(&ctx, "external-recovery-fees", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
 
-    assert_eq!(frozen_recovery_evidence(&frozen_paths), frozen,
-        "saved SaplingOS signatures or agreed payouts changed after shutdown");
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
 
     // Reach an independently chosen 6-confirmation policy before redemption.
     ctx.bitcoind().generate(6).await;
@@ -474,8 +523,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
         .expect("supply the two-holder regtest PSBT spender Python path"));
     let combined = artifact_dir.join("both-signed-recoveries.json");
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
     run_fixture_executable(&merger, &[
         alice_file.as_os_str(), bob_file.as_os_str(),
         terms_file.as_os_str(), combined.as_os_str(),
@@ -528,8 +576,7 @@ async fn sapio_real_two_holder_offline_recovery() {
         assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
             .confirmations.unwrap_or(0) >= 1);
     }
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
     fs::remove_file(cli).unwrap();
 }
 
@@ -668,7 +715,8 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         terms_file.as_path(), alice_file.as_path(), bob_file.as_path(),
     ];
     let frozen = frozen_recovery_evidence(&frozen_paths);
-    save_json(&dir.join("frozen-evidence-before-shutdown.json"), &frozen);
+    let frozen_manifest = dir.join("frozen-evidence-before-shutdown.json");
+    save_json(&frozen_manifest, &frozen);
     drop(coordinator_a);
     drop(coordinator_b);
 
@@ -683,21 +731,21 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     drop(sender);
     tee.stop().await.unwrap();
     srv.stop().await.unwrap();
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err());
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err());
 
-    recover_offline(&ctx, "alice", Some(&alice_file), &bundle_a).await;
+    recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
     assert!(ctx.bitcoind().sync_client().get_raw_transaction(
         &bundle_b.recoveries.iter().find(|r| r.controlled_outpoint == bob_point)
             .unwrap().claim.compute_txid(), None).is_err(),
         "Bob's VTXO paid out before Bob independently requested his recovery");
-    recover_offline(&ctx, "bob", Some(&bob_file), &bundle_b).await;
+    recover_offline(&ctx, "external-recovery-fees", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
     ctx.bitcoind().generate(6).await;
 
-    assert_eq!(frozen_recovery_evidence(&frozen_paths), frozen,
-        "saved SaplingOS signatures or agreed payouts changed after shutdown");
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
 
     let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER")
         .expect("build the pinned merged-bundle verifier"));
@@ -706,6 +754,7 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
         .expect("supply independent Bitcoin Core PSBT spend runner"));
     let merged = dir.join("both-signed-recoveries.json");
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
     run_fixture_executable(&merger, &[
         alice_file.as_os_str(), bob_file.as_os_str(),
         terms_file.as_os_str(), merged.as_os_str()
@@ -760,5 +809,6 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     assert_eq!(receipt["independent_spends_confirmed"], true);
     assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
     save_json(&dir.join("two-holder-redemptions.json"), &receipt);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
     fs::remove_file(cli).unwrap();
 }
