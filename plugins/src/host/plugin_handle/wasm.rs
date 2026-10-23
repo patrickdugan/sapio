@@ -668,7 +668,10 @@ mod tests {
         let exhausted = error.downcast_ref::<FuelExhausted>().expect("fuel error");
         assert_eq!(exhausted.module, WASMCacheID::generate(source.as_bytes()));
         assert_eq!(exhausted.export, "sapio_v1_wasm_plugin_entry_point");
-        assert_eq!(exhausted.limit, crate::host::runtime::COMPILER_INSTANCE_FUEL);
+        assert_eq!(
+            exhausted.limit,
+            crate::host::runtime::COMPILER_INSTANCE_FUEL
+        );
         assert!(exhausted.source().unwrap().is::<RuntimeError>());
     }
 
@@ -717,7 +720,10 @@ mod tests {
             let exhausted = source.downcast_ref::<FuelExhausted>().expect("fuel error");
             assert_eq!(exhausted.module, plugin.id());
             assert_eq!(exhausted.export, format!("sapio_v1_wasm_plugin_{export}"));
-            assert_eq!(exhausted.limit, crate::host::runtime::COMPILER_INSTANCE_FUEL);
+            assert_eq!(
+                exhausted.limit,
+                crate::host::runtime::COMPILER_INSTANCE_FUEL
+            );
             assert!(exhausted.source().unwrap().is::<RuntimeError>());
             assert_eq!(
                 get_remaining_points(&mut plugin.store, &plugin._instance),
