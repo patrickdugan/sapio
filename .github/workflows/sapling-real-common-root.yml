@@ -51,6 +51,12 @@ jobs:
           df -h /
 
       - name: Compile pinned service binaries and exercise real regtest recovery
+        env:
+          # Nix shells can inject an incompatible glibc into the runner environment.
+          # The Swagger UI build script shells out to curl; keep this build on the
+          # host's own curl/glibc pair while pinned Nix subcommands manage theirs.
+          LD_LIBRARY_PATH: ""
+          LD_PRELOAD: ""
         run: |
           set -euo pipefail
           export XDG_CACHE_HOME="$RUNNER_TEMP/sapling-recovery-cache"
