@@ -427,19 +427,44 @@ binaries and has not been run by the lightweight dedicated CI.
 
 ### Immutable export checks during the service outage
 
-The two real-service fixture paths additionally snapshot SHA-256 digests
-and byte counts for the independently agreed payout terms and each holder's
-signed recovery export **before** the cosigner and Ark services stop.
-After the offline publication and immediately before combining the
-bundles, the fixture recomputes those digests and fails on any changed
-byte. It repeats this check after the separate Bitcoin Core spends.
+Both real-service fixtures snapshot SHA-256 digests and byte counts for
+the independently agreed payout terms and each holder's signed recovery
+export **before** the Sapio cosigner and Ark service stop. After both
+services shut down, after recovery, immediately before bundle merging,
+and after separate Bitcoin Core withdrawals, each fixture recomputes those
+digests. It also compares the saved pre-shutdown manifest to its
+in-memory snapshot, rejecting edits to the manifest itself.
 
-This prevents the test from accepting a substituted or rolled-back saved
-export simply because a second cryptographically valid claim exists.
-The saved originals remain private, and only their digests are eligible
-for the sanitized proof receipt. This additional guard is staged on the
-`research/sapling-proof-freeze-qa-2026-10-23` branch pending promotion
-after the ongoing pinned full-service run completes.
+The `frozen_evidence_guard_rejects_substitution_and_manifest_rewrites`
+unit test changes each original file and the manifest in turn, requiring
+every substitution to fail the same guard used by the service fixtures.
+These are checkpoint-integrity assertions over saved regtest evidence,
+not filesystem immutability guarantees against a continuously active
+adversary. Signed originals remain private; only their names, sizes and
+hashes are eligible for the sanitized public receipt.
+
+In the common-root fixture, native offline publication opens only the
+separate `external-recovery-fees` SDK wallet, using independently funded
+Bitcoin UTXOs. Alice's and Bob's program wallets remain stopped.
+
+### Full-service GitHub Actions build blocker and isolated repair
+
+[Full-service run 39807849809](https://github.com/patrickdugan/sapio/actions/runs/39807849809)
+failed in pinned upstream Cargo compilation before any recovery fixture
+ran. `utoipa-swagger-ui 9.0.2` tried to launch the host's `curl`
+inside a Nix development shell and hit a mixed-glibc dynamic linker error.
+The follow-up host-library-path repair
+([branch `fix/sapling-regtest-host-curl-20261023`](https://github.com/patrickdugan/sapio/tree/fix/sapling-regtest-host-curl-20261023))
+also failed at the same build-script download.
+
+The separate QA branch prefetches Swagger UI version 5.17.14 from its
+tagged commit `74ed0adebfc9c8dd0de2bf8e81495b022a66c083` before
+entering the Nix build, validates the ZIP structure, and passes it to
+the pinned crate through its supported `SWAGGER_UI_DOWNLOAD_URL=file://`
+interface. The upstream SaplingOS revision and Cargo locks remain
+unchanged. A fresh full-service run must still compile, execute native
+SaplingOS recovery, and emit an independently validated receipt before
+any shared-root cryptographic recovery claim can be promoted.
 
 ## Verification boundaries
 
