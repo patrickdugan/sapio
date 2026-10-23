@@ -50,6 +50,34 @@ jobs:
             libboost-all-dev postgresql-16 postgresql-client-16 wabt
           df -h /
 
+      # utoipa-swagger-ui 9.0.2 downloads v5.17.14 in its build.rs. A curl
+      # subprocess inside pinned Nix shells can link the host libc against
+      # the Nix glibc and fail. Stage the immutable tagged commit outside Nix
+      # and let the crate's supported file:// path consume it without curl.
+      - name: Stage pinned Swagger UI archive outside Nix
+        run: |
+          set -euo pipefail
+          SWAGGER_COMMIT=74ed0adebfc9c8dd0de2bf8e81495b022a66c083
+          archive="$RUNNER_TEMP/swagger-ui-${SWAGGER_COMMIT}.zip"
+          env -u LD_LIBRARY_PATH -u LD_PRELOAD /usr/bin/curl \
+            --proto '=https' --tlsv1.2 --retry 3 --fail --location \
+            --silent --show-error \
+            "https://github.com/swagger-api/swagger-ui/archive/${SWAGGER_COMMIT}.zip" \
+            --output "$archive"
+          python3 - "$archive" <<'PY'
+          from pathlib import Path
+          import sys
+          from zipfile import ZipFile
+          path = Path(sys.argv[1])
+          with ZipFile(path) as archive:
+              entries = archive.namelist()
+              assert len([p for p in entries if p.endswith(
+                  "/dist/swagger-initializer.js")]) == 1, "wrong Swagger UI archive"
+              assert archive.testzip() is None, "corrupted Swagger UI archive"
+          PY
+          sha256sum "$archive"
+          echo "SWAGGER_UI_DOWNLOAD_URL=file://$archive" >> "$GITHUB_ENV"
+
       - name: Compile pinned service binaries and exercise real regtest recovery
         run: |
           set -euo pipefail
