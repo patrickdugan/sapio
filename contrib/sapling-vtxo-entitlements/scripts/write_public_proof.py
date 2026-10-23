@@ -10,6 +10,7 @@ are never copied into the output.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -143,4 +144,7 @@ if __name__ == "__main__":
         main()
     except (ValueError, KeyError, TypeError, OSError) as exc:
         print("public proof refused: " + str(exc), file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            # Job logs need sign-in; annotations are publicly readable.
+            print("::error title=public proof refused::" + str(exc).replace("%", "%25"))
         sys.exit(1)
