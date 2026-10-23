@@ -366,6 +366,11 @@ SAPLING_TWO_HOLDER_BITCOIN_CLI=/absolute/path/to/bitcoin-cli \
 bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
 ```
 
+This default, `sapio_real_two_holder_offline_recovery`, boards Alice and
+Bob **separately** from two funded roots. It first passed at `6796e66`
+in run 39985609087, which validated it with `write_public_proof.py
+--scenario separate-roots`. CI runs both scenarios on every change.
+
 To exercise Alice and Bob as **common-root siblings** created by two
 sequential native transfers of one real Ark VTXO, select the second
 opt-in integration scenario:

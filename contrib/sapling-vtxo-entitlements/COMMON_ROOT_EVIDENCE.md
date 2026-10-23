@@ -1,10 +1,12 @@
-# Genuine common-root recovery: regtest evidence
+# Genuine two-holder recovery: regtest evidence
 
-This records the first passing run of
-`sapio_real_common_anchor_two_holder_recovery` against pinned, really
-running SaplingOS, Sapio TEE (local-dev), Ark server and Bitcoin Core
-fixtures. It establishes that fixture's behaviour under its regtest
-assumptions. It is not a general security proof.
+This records passing runs of two scenarios against pinned, really running
+SaplingOS, Sapio TEE (local-dev), Ark server and Bitcoin Core fixtures:
+common-root siblings (`sapio_real_common_anchor_two_holder_recovery`) and
+separately boarded holders (`sapio_real_two_holder_offline_recovery`).
+They are different security properties. Each run establishes only that
+fixture's behaviour under its regtest assumptions; it is not a general
+security proof.
 
 ## Passing receipt
 
@@ -20,6 +22,22 @@ Downloading Actions artifacts needs a signed-in GitHub account. The same
 `public-regtest-proof.json` is also published as three `public-regtest-proof
 n/3` notice annotations on the job, which the unauthenticated REST API
 serves (`GET /repos/patrickdugan/sapio/check-runs/120328785917/annotations`).
+
+### Later receipts
+
+Every receipt comes from a fresh disposable regtest, so the transaction IDs
+differ between runs while the checked properties stay the same.
+
+| Head | Run | Scenario | Artifact |
+| --- | --- | --- | --- |
+| `71dfe77` | [39932359296](https://github.com/patrickdugan/sapio/actions/runs/39932359296) | common-root | id 12492468474, `sha256:7fc81015…3f34` |
+| `6796e66` | [39985609087](https://github.com/patrickdugan/sapio/actions/runs/39985609087) | common-root | id 12519330713, `sha256:70ca4982…478a` |
+| `6796e66` | [39985609087](https://github.com/patrickdugan/sapio/actions/runs/39985609087) | separate-roots | id 12519635338, `sha256:14d86288…e0a8` |
+
+From run 39985609087 on, both proofs are re-checked by the hardened
+`write_public_proof.py` described below. Their notice annotations are titled
+`public-regtest-proof <scenario> n/m`. Every check on `6796e66` passed,
+including `wasm` and `Build-a-vault modules`, which #5 fixed.
 
 ## What the run checked
 
@@ -73,6 +91,45 @@ Every item below is an assertion in the test or in
   `9ad1f160…e1ce` (39,780 paid, 220 fee). Both are mined, each input has
   a witness, and the frozen evidence is unchanged afterwards.
 
+## Separately boarded holders (distinct property)
+
+`sapio_real_two_holder_offline_recovery` first passed at `6796e66` in run
+[39985609087](https://github.com/patrickdugan/sapio/actions/runs/39985609087)
+(artifact `saplingos-real-separate-roots-regtest-proof`, id 12519635338).
+It runs on the same pinned fixtures, with the same shutdown ordering
+(without the sender), the same frozen-evidence, fee-sponsor, audit and
+redemption checks, and these differences:
+
+- **Two funded roots.** Alice and Bob each board their own program VTXO,
+  60,000 and 40,000 sats, from separate on-chain outputs
+  (`cd6c15ed…4196:0` and `b65e12c8…a843:0` in that run). The test
+  requires the roots to differ and each root to hold at least its
+  holder's agreed amount.
+- **No shared signed transaction.** Each holder's saved path is one
+  signed ancestor plus a claim. No saved transaction appears in both
+  exports, and all four confirmed above the shutdown height 114.
+- **Sponsor-funded.** The fees, 8,936 sats over four packages, trace back
+  to the sponsor's only pre-shutdown UTXO.
+
+This shows that two separately funded holders can each recover alone
+after the services stop. It says nothing about shared economic backing,
+which is what the common-root scenario tests.
+
+### Validator hardening
+
+An independent review (Codex) found that the first version of
+`write_public_proof.py` trusted the capture's own `used_by` labels and
+funding-root entries. A relabelled common-root capture or a substituted
+root could therefore have passed as "separate roots". The validator now
+decodes the hash-frozen signed exports and computes txids and wtxids from
+their consensus bytes. It derives each holder's path, holder membership
+and funding root (outpoint and authenticated prevout value) from those
+exports. The published rows must cover exactly that transaction set,
+with matching roles, wtxids and membership, and the recorded roots must
+equal those in the exports. Unit tests cover the relabelled and
+substituted-root attacks, and check the decoder against the genesis
+coinbase txid.
+
 ## Trust assumptions
 
 - Disposable regtest with one Bitcoin Core node, which every verifier
@@ -92,9 +149,9 @@ Every item below is an assertion in the test or in
 
 ## Not established
 
-- The **separately boarded** two-holder scenario
-  (`sapio_real_two_holder_offline_recovery`) and the single joint-output
-  unilateral exit are different properties. Neither was run here.
+- The single joint-output unilateral exit, a different property, has not
+  been run. The separately boarded scenario is covered in its own section
+  above.
 - Recovery when the operator or another VTXO holder acts adversarially:
   conflicting spends of shared ancestors, competing CPFP, or a timelock
   race.
