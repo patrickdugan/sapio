@@ -1005,14 +1005,24 @@ async fn common_anchor_fixture(stale_sender_attack: bool) {
     let bob_file = dir.join("bob-recovery.json");
     save_json(&alice_file, &bundle_a);
     save_json(&bob_file, &bundle_b);
-    let frozen_paths = [
+    let stale_file = dir.join("stale-sender-recovery.json");
+    if let Some((_, saved)) = &stale_sender {
+        save_json(&stale_file, saved);
+    }
+    let mut frozen_paths = vec![
         terms_file.as_path(), alice_file.as_path(), bob_file.as_path(),
     ];
+    if stale_sender.is_some() {
+        frozen_paths.push(stale_file.as_path());
+    }
     let frozen = frozen_recovery_evidence(&frozen_paths);
     let frozen_manifest = dir.join("frozen-evidence-before-shutdown.json");
     let frozen_manifest_bytes = freeze_manifest(&frozen_manifest, &frozen);
     let holders = [("alice", &bundle_a), ("bob", &bundle_b)];
     assert_unpublished(&ctx, &holders);
+    if let Some((_, saved)) = &stale_sender {
+        assert_unpublished(&ctx, &[("stale-sender", saved)]);
+    }
     drop(coordinator_a);
     drop(coordinator_b);
 
