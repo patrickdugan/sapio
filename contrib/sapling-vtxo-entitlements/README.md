@@ -319,8 +319,18 @@ Copy the `export` assignments printed by both scripts into the same shell
 before running `run_real_two_holder.sh`. The second bootstrap pins
 `stutxo/saplingos@b45e5ef`, `ark-bitcoin/bark@626c9b`, and
 `BoltzExchange/hold@af0055`, compiles the Bark server/watchman and the
-hold plugin, and verifies release hashes of Bitcoin Core 30.3 and Core
+hold plugin, and verifies release hashes of Bitcoin Core 31.0 and Core
 Lightning 26.06.7. The Lightning release's gRPC plugin is included.
+The pinned `captaind` refuses Bitcoin Core older than v31
+(`MIN_BITCOIND_VERSION` in Bark's `server/src/bitcoind.rs`), and Bark's
+own dev shell uses 31.0. The 31.0 archive digest
+`d3e4c58a35b1d0a97a457462c94f55501ad167c660c245cb1ffa565641c65074`
+matches bitcoincore.org's `SHA256SUMS` and the fanquake, achow101, Sjors
+and Emzy attestations in
+[guix.sigs@3962bb94](https://github.com/bitcoin-core/guix.sigs/tree/3962bb942102c4bc242d08a137e31b9a74cf8fbe/31.0).
+Inside the pinned SaplingOS dev shell, `run_real_two_holder.sh` starts the
+distribution-linked PostgreSQL and Core Lightning binaries through
+wrappers that clear the shell's Nix `LD_LIBRARY_PATH`.
 The preflight job checks the public source revisions and official CLN
 archive layout. Its checksum is sourced from that release's GitHub
 asset digest. Rebuilding service binaries may consume substantial CPU
@@ -356,6 +366,11 @@ SAPLING_TWO_HOLDER_BITCOIN_CLI=/absolute/path/to/bitcoin-cli \
 bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh
 ```
 
+This default, `sapio_real_two_holder_offline_recovery`, boards Alice and
+Bob **separately** from two funded roots. It first passed at `6796e66`
+in run 39985609087, which validated it with `write_public_proof.py
+--scenario separate-roots`. CI runs both scenarios on every change.
+
 To exercise Alice and Bob as **common-root siblings** created by two
 sequential native transfers of one real Ark VTXO, select the second
 opt-in integration scenario:
@@ -371,8 +386,9 @@ its actual Bitcoin chain anchor. It then runs both independently
 saved recovery exports through the same cross-target backing auditor
 and requires separate confirmed wallet redemptions after service
 shutdown. Any remaining 20,000 sats in the parent wallet remain outside
-these two selected claims. This scenario is **experimental until the
-pinned real-service suite runs successfully**.
+these two selected claims. The pinned real-service suite first passed this
+scenario at `18f6802` in run 39927925655; see [COMMON_ROOT_EVIDENCE.md](COMMON_ROOT_EVIDENCE.md)
+for the receipt, its trust assumptions and what it does not establish.
 
 The driver also accepts `SAPLING_TWO_HOLDER_CAPTURE_DIR`; otherwise it
 chooses a new private directory under the user's local state home.
@@ -424,6 +440,47 @@ optional common-root sibling fixture tests shared signed ancestry. A
 single joint-output claim with two independently executable unilateral
 withdrawals is a further distinct property. The real integration requires external service
 binaries and has not been run by the lightweight dedicated CI.
+
+### Immutable export checks during the service outage
+
+Both real-service fixtures snapshot SHA-256 digests and byte counts for
+the independently agreed payout terms and each holder's signed recovery
+export **before** the Sapio cosigner and Ark service stop. After both
+services shut down, after recovery, immediately before bundle merging,
+and after separate Bitcoin Core withdrawals, each fixture recomputes those
+digests. It also compares the saved pre-shutdown manifest to its
+in-memory snapshot, rejecting edits to the manifest itself.
+
+The `frozen_evidence_guard_rejects_substitution_and_manifest_rewrites`
+unit test changes each original file and the manifest in turn, requiring
+every substitution to fail the same guard used by the service fixtures.
+These are checkpoint-integrity assertions over saved regtest evidence,
+not filesystem immutability guarantees against a continuously active
+adversary. Signed originals remain private; only their names, sizes and
+hashes are eligible for the sanitized public receipt.
+
+In the common-root fixture, native offline publication opens only the
+separate `external-recovery-fees` SDK wallet, using independently funded
+Bitcoin UTXOs. Alice's and Bob's program wallets remain stopped.
+
+### Full-service GitHub Actions build blocker and isolated repair
+
+[Full-service run 39807849809](https://github.com/patrickdugan/sapio/actions/runs/39807849809)
+failed in pinned upstream Cargo compilation before any recovery fixture
+ran. `utoipa-swagger-ui 9.0.2` tried to launch the host's `curl`
+inside a Nix development shell and hit a mixed-glibc dynamic linker error.
+The follow-up host-library-path repair
+([branch `fix/sapling-regtest-host-curl-20261023`](https://github.com/patrickdugan/sapio/tree/fix/sapling-regtest-host-curl-20261023))
+also failed at the same build-script download.
+
+The separate QA branch prefetches Swagger UI version 5.17.14 from its
+tagged commit `74ed0adebfc9c8dd0de2bf8e81495b022a66c083` before
+entering the Nix build, validates the ZIP structure, and passes it to
+the pinned crate through its supported `SWAGGER_UI_DOWNLOAD_URL=file://`
+interface. The upstream SaplingOS revision and Cargo locks remain
+unchanged. A fresh full-service run must still compile, execute native
+SaplingOS recovery, and emit an independently validated receipt before
+any shared-root cryptographic recovery claim can be promoted.
 
 ## Verification boundaries
 

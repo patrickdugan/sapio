@@ -40,6 +40,7 @@ if [[ -e "$CAPTURE_DIR/alice-recovery.json" || -e "$CAPTURE_DIR/bob-recovery.jso
     echo "Capture directory already holds signed exports. Choose a fresh SAPLING_TWO_HOLDER_CAPTURE_DIR" >&2
     exit 1
 fi
+echo "==> stage: auditor-build"
 TARGET_DIR="${SAPLING_TWO_HOLDER_TARGET_DIR:-$REPO/contrib/sapling-vtxo-entitlements/target}"
 cargo build --locked --manifest-path "$MANIFEST" --bins --target-dir "$TARGET_DIR"
 MERGER="$TARGET_DIR/debug/merge-bundles"
@@ -53,6 +54,36 @@ cleanup() {
     rm -rf "$TEMP"
 }
 trap cleanup EXIT
+
+# The pinned upstream dev shell exports LD_LIBRARY_PATH with Nix OpenSSL,
+# SQLite and gcc libraries. Distribution-linked fixtures started inside it
+# (Ubuntu PostgreSQL, the Core Lightning release and its plugins) then load
+# Nix libraries built against Nix glibc on top of the host libc and fail,
+# e.g. initdb: "version `GLIBC_ABI_DT_X86_64_PLT' not found". Give each a
+# clean loader path. exec keeps the PID, and argv[0] stays the original
+# binary, so initdb/pg_ctl still find `postgres` and lightningd its
+# subdaemons beside the real executable. Bitcoin Core release binaries
+# link only glibc, and the Nix-built Ark, TEE and hold binaries carry
+# their own RUNPATH, so those run unchanged.
+HOST_FIXTURES="$TEMP/host-linked-fixtures"
+wrap_host_dir() {
+    local source="$1" destination="$2" executable
+    mkdir -p "$destination"
+    for executable in "$source"/*; do
+        [[ -f "$executable" && -x "$executable" ]] || continue
+        printf '#!/bin/bash\nexec /usr/bin/env -u LD_LIBRARY_PATH %q "$@"\n' \
+            "$(realpath "$executable")" > "$destination/$(basename "$executable")"
+        chmod 755 "$destination/$(basename "$executable")"
+    done
+}
+wrap_host_dir "$POSTGRES_BINS" "$HOST_FIXTURES/postgres"
+wrap_host_dir "$(dirname "$(realpath "$LIGHTNINGD_EXEC")")" "$HOST_FIXTURES/cln"
+export POSTGRES_BINS="$HOST_FIXTURES/postgres"
+export LIGHTNINGD_EXEC="$HOST_FIXTURES/cln/$(basename "$(realpath "$LIGHTNINGD_EXEC")")"
+[[ -x "$POSTGRES_BINS/initdb" && -x "$LIGHTNINGD_EXEC" ]] || {
+    echo "Failed to prepare clean-loader fixture wrappers" >&2
+    exit 1
+}
 
 git -C "$UPSTREAM" worktree add --detach "$WORKTREE" "$PIN"
 cp "$SCRIPT_DIR/../e2e/sapio_two_holder.rs" "$WORKTREE/testing/tests/sdk/sapio/two_holder.rs"
@@ -78,8 +109,15 @@ echo "Pinned SaplingOS revision: $PIN"
 echo "Capture directory: $CAPTURE_DIR"
 cd "$WORKTREE"
 
+# Execute the same Rust freeze guard against forged saved evidence before
+# spending time running the service-loss fixture. The pinned build artifacts
+# remain in this worktree and are reused for the real test below.
+echo "==> stage: freeze-guard (pinned SDK test build + adversarial evidence check)"
+./contrib/sapio-e2e.sh frozen_evidence_guard_rejects_substitution_and_manifest_rewrites
+
 # The upstream recipe validates real-service dependencies and creates a
 # private network namespace if the platform supports bubblewrap isolation.
+echo "==> stage: service-loss recovery ($TEST_FILTER)"
 ./contrib/sapio-e2e.sh "$TEST_FILTER"
 
 test -s "$CAPTURE_DIR/two-holder-pre-spend-report.json"

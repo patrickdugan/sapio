@@ -63,7 +63,7 @@ fn export_error(
         Box::new(FuelExhausted {
             module,
             export,
-            limit: crate::host::runtime::INSTANCE_FUEL,
+            limit: crate::host::runtime::COMPILER_INSTANCE_FUEL,
             source,
         })
     } else {
@@ -668,7 +668,10 @@ mod tests {
         let exhausted = error.downcast_ref::<FuelExhausted>().expect("fuel error");
         assert_eq!(exhausted.module, WASMCacheID::generate(source.as_bytes()));
         assert_eq!(exhausted.export, "sapio_v1_wasm_plugin_entry_point");
-        assert_eq!(exhausted.limit, crate::host::runtime::INSTANCE_FUEL);
+        assert_eq!(
+            exhausted.limit,
+            crate::host::runtime::COMPILER_INSTANCE_FUEL
+        );
         assert!(exhausted.source().unwrap().is::<RuntimeError>());
     }
 
@@ -717,7 +720,10 @@ mod tests {
             let exhausted = source.downcast_ref::<FuelExhausted>().expect("fuel error");
             assert_eq!(exhausted.module, plugin.id());
             assert_eq!(exhausted.export, format!("sapio_v1_wasm_plugin_{export}"));
-            assert_eq!(exhausted.limit, crate::host::runtime::INSTANCE_FUEL);
+            assert_eq!(
+                exhausted.limit,
+                crate::host::runtime::COMPILER_INSTANCE_FUEL
+            );
             assert!(exhausted.source().unwrap().is::<RuntimeError>());
             assert_eq!(
                 get_remaining_points(&mut plugin.store, &plugin._instance),
@@ -805,7 +811,7 @@ mod tests {
             "(local $left i32) i32.const {} local.set $left
              (loop local.get $left i32.const 1 i32.sub local.tee $left br_if 0)
              i32.const 8",
-            crate::host::runtime::INSTANCE_FUEL / 20,
+            crate::host::runtime::COMPILER_INSTANCE_FUEL / 20,
         );
         let source = plugin_source(&body, "", 16);
         let binary = wasmer::wat2wasm(source.as_bytes()).unwrap().into_owned();
@@ -817,7 +823,7 @@ mod tests {
         )
         .unwrap();
         let initial = remaining_fuel(&mut original);
-        assert!(initial > 0 && initial <= crate::host::runtime::INSTANCE_FUEL);
+        assert!(initial > 0 && initial <= crate::host::runtime::COMPILER_INSTANCE_FUEL);
         assert_eq!(original.get_name().unwrap(), "ok");
         assert!(remaining_fuel(&mut original) < initial);
         exhaust_finite_calls(&mut original);

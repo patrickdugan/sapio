@@ -1,4 +1,4 @@
-name: SaplingOS genuine common-root recovery on disposable regtest
+name: SaplingOS genuine two-holder recovery on disposable regtest
 
 # Heavy opt-in-by-PR experiment: builds pinned Ark, TEE and CLN services,
 # then destroys both Ark and Sapio signers before publishing recovered claims.
@@ -7,6 +7,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/sapling-real-common-root.yml"
+      - "contrib/sapling-vtxo-entitlements/e2e/**"
+      - "contrib/sapling-vtxo-entitlements/scripts/**"
   workflow_dispatch:
 
 permissions:
@@ -23,6 +25,10 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
+      # Line tables keep panic backtraces readable while shrinking the
+      # cached debug targets of the TEE and the pinned SDK test suite.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v7
 
@@ -34,6 +40,18 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/julia* \
             2>/dev/null || true
           df -h /
+
+      # Pinned sources and their build outputs only. Keys change with the
+      # pins in the bootstrap scripts; no regtest datadir, wallet seed or
+      # signed export lives under this path.
+      - name: Restore pinned fixture builds
+        id: fixture-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/sapling-recovery-cache
+          key: sapling-real-${{ hashFiles('contrib/sapling-vtxo-entitlements/scripts/bootstrap_*.sh') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sapling-real-${{ hashFiles('contrib/sapling-vtxo-entitlements/scripts/bootstrap_*.sh') }}-
 
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
         with:
@@ -50,94 +68,181 @@ jobs:
             libboost-all-dev postgresql-16 postgresql-client-16 wabt
           df -h /
 
-      - name: Compile pinned service binaries and exercise real regtest recovery
+      # utoipa-swagger-ui 9.0.2 downloads v5.17.14 in its build.rs. A curl
+      # subprocess inside pinned Nix shells can link the host libc against
+      # the Nix glibc and fail. Stage the immutable tagged commit outside Nix
+      # and let the crate's supported file:// path consume it without curl.
+      - name: Stage pinned Swagger UI archive outside Nix
         run: |
           set -euo pipefail
+          SWAGGER_COMMIT=74ed0adebfc9c8dd0de2bf8e81495b022a66c083
+          archive="$RUNNER_TEMP/swagger-ui-${SWAGGER_COMMIT}.zip"
+          env -u LD_LIBRARY_PATH -u LD_PRELOAD /usr/bin/curl \
+            --proto '=https' --tlsv1.2 --retry 3 --fail --location \
+            --silent --show-error \
+            "https://github.com/swagger-api/swagger-ui/archive/${SWAGGER_COMMIT}.zip" \
+            --output "$archive"
+          python3 - "$archive" <<'PY'
+          from pathlib import Path
+          import sys
+          from zipfile import ZipFile
+          path = Path(sys.argv[1])
+          with ZipFile(path) as archive:
+              entries = archive.namelist()
+              assert len([p for p in entries if p.endswith(
+                  "/dist/swagger-initializer.js")]) == 1, "wrong Swagger UI archive"
+              assert archive.testzip() is None, "corrupted Swagger UI archive"
+          PY
+          sha256sum "$archive"
+          echo "SWAGGER_UI_DOWNLOAD_URL=file://$archive" >> "$GITHUB_ENV"
+
+      - name: Compile pinned service binaries and fixtures
+        id: bootstrap
+        run: |
+          set -euo pipefail
+          # Keep each stage log on the runner for failure annotations.
+          exec > >(tee -a "$RUNNER_TEMP/regtest-bootstrap.log") 2>&1
           export XDG_CACHE_HOME="$RUNNER_TEMP/sapling-recovery-cache"
           export SAPLING_TEE_SOURCE_DIR="$XDG_CACHE_HOME/sapio_tee-f083bdbd2343aad22fab861f1565c0f2c2e6b0af"
           export SAPLING_FIXTURE_TOOLS_DIR="$XDG_CACHE_HOME/fixture-tools"
-          export SAPLING_TWO_HOLDER_CAPTURE_DIR="$RUNNER_TEMP/signed-regtest-recovery"
+          export SAPLING_TWO_HOLDER_TARGET_DIR="$XDG_CACHE_HOME/auditor-target"
+          df -h /
+          du -sh "$XDG_CACHE_HOME" 2>/dev/null || echo "no restored fixture cache"
 
+          echo "==> stage: bootstrap-tee (pinned Sapio TEE build)"
           bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_localdev_tee.sh --build-only \
             | tee "$RUNNER_TEMP/tee-exports.log"
           source <(grep '^export ' "$RUNNER_TEMP/tee-exports.log")
 
+          echo "==> stage: bootstrap-fixtures (Core, CLN, Bark, hold)"
           bash contrib/sapling-vtxo-entitlements/scripts/bootstrap_regtest_fixtures.sh \
             | tee "$RUNNER_TEMP/service-exports.log"
           source <(grep '^export ' "$RUNNER_TEMP/service-exports.log")
 
-          # The pinned SaplingOS e2e suite starts fresh test instances itself.
-          # The external wallets and signers are stopped before recovery replay.
+          # Prove the nested pinned Nix shell still sees the staged artifact
+          # before spending time compiling the SaplingOS integration binary.
+          echo "==> stage: nix-shell-swagger-check"
+          nix develop --no-update-lock-file "$SAPLINGOS_CHECKOUT" -c bash -ceu '
+            [[ "${SWAGGER_UI_DOWNLOAD_URL:-}" == file:///* ]]
+            test -r "${SWAGGER_UI_DOWNLOAD_URL#file://}"
+          '
+
+          # Both scenarios reuse these pinned fixtures. The SDK e2e build
+          # outputs are cached; regtest datadirs are not.
+          for name in XDG_CACHE_HOME SAPLING_TEE_SOURCE_DIR SAPLING_FIXTURE_TOOLS_DIR \
+              SAPLING_TWO_HOLDER_TARGET_DIR SAPIO_TEE_EXEC SAPIO_TEMPLATEHASH_WASM \
+              SAPLINGOS_CHECKOUT CAPTAIND_EXEC WATCHMAND_EXEC BITCOIND_EXEC \
+              SAPLING_TWO_HOLDER_BITCOIN_CLI LIGHTNINGD_EXEC LIGHTNINGD_PLUGIN_DIR \
+              POSTGRES_BINS; do
+            [[ -n "${!name:-}" && "${!name}" != *$'\n'* ]]
+            echo "$name=${!name}" >> "$GITHUB_ENV"
+          done
+          echo "CARGO_TARGET_DIR=$XDG_CACHE_HOME/saplingos-e2e-target" >> "$GITHUB_ENV"
+          echo "TEST_DIRECTORY=$RUNNER_TEMP/saplingos-e2e-datadirs" >> "$GITHUB_ENV"
+          echo "==> stage: complete"
+
+      # The pinned SaplingOS e2e suite starts fresh test instances itself.
+      # The external wallets and signers are stopped before recovery replay.
+      - name: "Scenario: common-root siblings (one funded root, two holders)"
+        id: common
+        env:
+          SAPLING_TWO_HOLDER_CAPTURE_DIR: ${{ runner.temp }}/capture-common-root
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/regtest-common-root.log") 2>&1
           bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
             sapio_real_common_anchor_two_holder_recovery
-          test -s "$SAPLING_TWO_HOLDER_CAPTURE_DIR/two-holder-pre-spend-report.json"
-          test -s "$SAPLING_TWO_HOLDER_CAPTURE_DIR/two-holder-redemptions.json"
+          echo "==> stage: complete"
 
-          python3 - "$SAPLING_TWO_HOLDER_CAPTURE_DIR" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-          root = Path(sys.argv[1])
-          def load(name):
-              return json.loads((root / name).read_text())
-          signed = load("frozen-evidence-before-shutdown.json")
-          fees = load("confirmed-p2a-fee-children.json")
-          audit = load("two-holder-pre-spend-report.json")
-          redeemed = load("two-holder-redemptions.json")
-          assert fees["real_common_root"] is True
-          assert fees["services_offline_when_fee_children_mined"] is True
-          assert fees["external_fee_wallet_keys_distinct_from_holders"] is True
-          assert audit["offline"]["total_protected_sats"] == 100_000
-          assert audit["offline"]["selected_paths_nonconflicting"] is True
-          assert audit["two_holder"]["total_payout_sats"] == 100_000
-          assert redeemed["independent_spends_confirmed"] is True
-          assert {p["holder"] for p in redeemed["redemptions"]} == {"alice", "bob"}
-          manifest_files = signed["files"]
-          assert {f["file"] for f in manifest_files} == {
-              "two-holder-terms.json", "alice-recovery.json", "bob-recovery.json"}
-          # Publish only public regtest txids and SHA-256s. Never upload the
-          # original signed bundles, wallet seeds, RPC secrets or service logs.
-          output = {
-              "proof_kind": "actual-pinned-saplingos-common-root-regtest",
-              "sdk_revision": "b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d",
-              "tee_revision": "f083bdbd2343aad22fab861f1565c0f2c2e6b0af",
-              "bark_revision": "626c9b241dd25d73212915d8fca959ab5e3b8f1f",
-              "common_root": fees["shared_chain_anchor"],
-              "separate_service_free_recovery": True,
-              "holder_claims": [
-                  {
-                      "holder": h["holder"],
-                      "claim_txid": h["confirmed_claim_txid"],
-                      "claim_wtxid": h["confirmed_claim_wtxid"],
-                      "payout_outpoint": h["payout_outpoint"],
-                      "sats": h["sats"]
-                  } for h in audit["two_holder"]["holders"]
-              ],
-              "recovery_fee_children": {
-                  holder: {
-                      "txid": fees[holder]["fee_child_txid"],
-                      "wtxid": fees[holder]["fee_child_wtxid"],
-                      "funded_fee_sats": fees[holder]["external_fee_sats"]
-                  } for holder in ("alice", "bob")
-              },
-              "independent_redemptions": [
-                  {"holder": p["holder"], "txid": p["txid"],
-                   "paid_sats": p["paid_sats"], "fee_sats": p["fee_sats"]}
-                  for p in redeemed["redemptions"]
-              ],
-              "pre_shutdown_export_hashes": manifest_files,
-          }
-          Path("public-regtest-proof.json").write_text(
-              json.dumps(output, sort_keys=True, indent=2) + "\n"
-          )
-          print("Genuine two-holder regtest evidence validated.")
-          PY
+      # Publish only public regtest txids, heights, amounts and SHA-256s.
+      # Never upload the signed bundles, terms, wallet seeds, RPC cookies or
+      # service logs.
+      - name: Independently validate common-root capture and write public proof
+        id: proof-common
+        if: steps.common.outcome == 'success'
+        env:
+          # On pull_request, GITHUB_SHA is the temporary merge commit; also
+          # record the branch head that a reviewer can check out.
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          bash contrib/sapling-vtxo-entitlements/scripts/publish_public_proof.sh \
+            common-root "$RUNNER_TEMP/capture-common-root" public-regtest-proof.json
 
-      - name: Preserve only non-secret regtest proof receipt
-        if: success()
+      - name: Preserve only non-secret common-root proof receipt
+        if: steps.proof-common.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: saplingos-real-common-root-regtest-proof
           path: public-regtest-proof.json
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 30
+
+      - name: "Scenario: separately boarded holders (two funded roots)"
+        id: separate
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        env:
+          SAPLING_TWO_HOLDER_CAPTURE_DIR: ${{ runner.temp }}/capture-separate-roots
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/regtest-separate-roots.log") 2>&1
+          bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
+            sapio_real_two_holder_offline_recovery
+          echo "==> stage: complete"
+
+      - name: Independently validate separate-roots capture and write public proof
+        id: proof-separate
+        if: ${{ !cancelled() && steps.separate.outcome == 'success' }}
+        env:
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          bash contrib/sapling-vtxo-entitlements/scripts/publish_public_proof.sh \
+            separate-roots "$RUNNER_TEMP/capture-separate-roots" public-regtest-proof-separate-roots.json
+
+      - name: Preserve only non-secret separate-roots proof receipt
+        if: ${{ !cancelled() && steps.proof-separate.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: saplingos-real-separate-roots-regtest-proof
+          path: public-regtest-proof-separate-roots.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Annotate bootstrap failure
+        if: ${{ always() && steps.bootstrap.outcome == 'failure' }}
+        run: |
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            "$RUNNER_TEMP/regtest-bootstrap.log" || true
+
+      - name: Annotate common-root failure
+        if: ${{ always() && steps.common.outcome == 'failure' }}
+        run: |
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            "$RUNNER_TEMP/regtest-common-root.log" || true
+
+      - name: Annotate separate-roots failure
+        if: ${{ always() && steps.separate.outcome == 'failure' }}
+        run: |
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            "$RUNNER_TEMP/regtest-separate-roots.log" || true
+
+      - name: Publish fixture daemon log tails as annotations
+        if: failure()
+        run: |
+          [[ -d "$RUNNER_TEMP/saplingos-e2e-datadirs" ]] || exit 0
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            --daemon-logs "$RUNNER_TEMP/saplingos-e2e-datadirs" || true
+
+      - name: Measure fixture cache before saving
+        if: always() && steps.bootstrap.outcome != 'skipped'
+        run: |
+          rm -rf "$RUNNER_TEMP/saplingos-e2e-datadirs"
+          du -sh "$RUNNER_TEMP"/sapling-recovery-cache/* 2>/dev/null || true
+          df -h /
+
+      - name: Save pinned fixture builds
+        if: always() && steps.bootstrap.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/sapling-recovery-cache
+          key: ${{ steps.fixture-cache.outputs.cache-primary-key }}
