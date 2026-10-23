@@ -91,6 +91,7 @@ class FakeNode:
         if method == "decoderawtransaction":
             return {
                 "txid": "c" * 64,
+                "hash": "d" * 64,
                 "vin": [{"txid": B if self.wrong_input else A, "vout": 0}],
                 "vout": [{
                     "value": float((60_000 - self.issued_fee) / 100_000_000),
@@ -182,6 +183,8 @@ class ReportTests(unittest.TestCase):
         proof = signed_redemption(node, receipt, "holder-alice", "bcrt1qtest", 2, 2_000)
         self.assertEqual(proof["fee_sats"], 500)
         self.assertEqual(proof["paid_sats"], 59_500)
+        self.assertEqual(proof["wtxid"], "d" * 64)
+        self.assertEqual(proof["spent_outpoint"], A + ":0")
         node.wrong_input = True
         with self.assertRaises(ValueError):
             signed_redemption(node, receipt, "holder-alice", "bcrt1qtest", 2, 2_000)

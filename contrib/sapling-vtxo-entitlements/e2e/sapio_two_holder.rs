@@ -141,6 +141,106 @@ fn require_external_fee_wallet_funding(
     }
 }
 
+/// Every signed transaction a saved export can publish, shared ancestors
+/// once, in the order a recovery must confirm them.
+fn recovery_transactions<'a>(
+    holders: &[(&'a str, &'a ProgramRecoveryBundle)],
+) -> Vec<(bitcoin::Txid, &'a Transaction, Vec<&'a str>, &'static str)> {
+    let mut rows: Vec<(bitcoin::Txid, &Transaction, Vec<&str>, &'static str)> = Vec::new();
+    for &(holder, bundle) in holders {
+        for target in &bundle.targets {
+            let record = bundle.recoveries.iter()
+                .find(|record| record.controlled_outpoint == *target)
+                .expect("selected VTXO has no signed recovery record");
+            let ancestors = record.ancestors.iter().map(|tx| (tx, "ancestor"));
+            for (tx, role) in ancestors.chain(std::iter::once((&record.claim, "claim"))) {
+                let txid = tx.compute_txid();
+                match rows.iter_mut().find(|row| row.0 == txid) {
+                    Some(row) => {
+                        assert_eq!(row.1, tx, "two exports disagree on one signed ancestor");
+                        assert_eq!(row.3, role, "one transaction is both a claim and an ancestor");
+                        row.2.push(holder);
+                    }
+                    None => rows.push((txid, tx, vec![holder], role)),
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// None of the saved signed transactions may be on Bitcoin before the
+/// services stop; recovery publication must happen strictly afterwards.
+fn assert_unpublished(ctx: &TestContext, holders: &[(&str, &ProgramRecoveryBundle)]) {
+    let rpc = ctx.bitcoind().sync_client();
+    for (txid, _, _, role) in recovery_transactions(holders) {
+        assert!(rpc.get_raw_transaction(&txid, None).is_err(),
+            "signed recovery {role} {txid} was published before service shutdown");
+    }
+}
+
+/// After recovery: each saved ancestor and claim is confirmed with exactly
+/// its saved bytes (witnesses included), above the recorded shutdown height,
+/// beside exactly one mined P2A fee child whose external inputs trace back
+/// to the sponsor's pre-shutdown coins.
+fn confirmed_recovery_chain(
+    ctx: &TestContext,
+    holders: &[(&str, &ProgramRecoveryBundle)],
+    shutdown_height: u64,
+    initial: &HashSet<OutPoint>,
+    recovery_anchors: &HashSet<OutPoint>,
+) -> Vec<serde_json::Value> {
+    let rpc = ctx.bitcoind().sync_client();
+    recovery_transactions(holders).into_iter().map(|(txid, saved, used_by, role)| {
+        let confirmed = rpc.get_raw_transaction(&txid, None)
+            .expect("saved signed recovery transaction is missing from Bitcoin Core");
+        assert_eq!(&confirmed, saved, "confirmed bytes differ from the saved signed {role}");
+        assert_eq!(bitcoin::consensus::serialize(&confirmed), bitcoin::consensus::serialize(saved));
+        let info = ctx.bitcoind().transaction_confirmation(txid).unwrap();
+        let blockhash = info.blockhash.expect("saved recovery transaction is unconfirmed");
+        let height = rpc.get_block_header_info(&blockhash).unwrap().height as u64;
+        assert!(height > shutdown_height, "{role} {txid} confirmed before the services stopped");
+        let anchors = saved.output.iter().enumerate()
+            .filter(|(_, out)| out.value == Amount::ZERO
+                && out.script_pubkey.as_bytes() == [0x51, 0x02, 0x4e, 0x73])
+            .map(|(i, _)| OutPoint::new(txid, i as u32))
+            .collect::<Vec<_>>();
+        assert_eq!(anchors.len(), 1, "signed {role} has no unique P2A anchor");
+        let anchor = anchors[0];
+        let block = rpc.get_block(&blockhash).unwrap();
+        let children = block.txdata.iter()
+            .filter(|tx| tx.input.iter().any(|input| input.previous_output == anchor))
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1, "{role} {txid} lacks one mined P2A fee child");
+        let child = children[0];
+        let external = child.input.iter().map(|input| input.previous_output)
+            .filter(|point| *point != anchor).collect::<Vec<_>>();
+        assert!(!external.is_empty(), "P2A fee child has no external funding input");
+        let mut input_sat = 0u64;
+        for point in child.input.iter().map(|input| input.previous_output) {
+            let parent = rpc.get_raw_transaction(&point.txid, None).unwrap();
+            input_sat += parent.output[point.vout as usize].value.to_sat();
+        }
+        for point in &external {
+            trace_sponsor_coin(ctx, *point, initial, recovery_anchors, &mut HashSet::new());
+        }
+        let output_sat: u64 = child.output.iter().map(|out| out.value.to_sat()).sum();
+        assert!(input_sat > output_sat, "P2A child paid no actual regtest mining fee");
+        json!({
+            "role": role,
+            "used_by": used_by,
+            "txid": txid.to_string(),
+            "wtxid": saved.compute_wtxid().to_string(),
+            "block_height": height,
+            "p2a_anchor": anchor.to_string(),
+            "fee_child_txid": child.compute_txid().to_string(),
+            "fee_child_wtxid": child.compute_wtxid().to_string(),
+            "external_fee_inputs": external.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "external_fee_sats": input_sat - output_sat,
+        })
+    }).collect()
+}
+
 /// The supplied terms and saved signed bundle bytes must survive the outage.
 fn frozen_recovery_evidence(paths: &[&Path]) -> serde_json::Value {
     let records = paths.iter().map(|path| {
@@ -162,16 +262,31 @@ fn frozen_recovery_evidence(paths: &[&Path]) -> serde_json::Value {
 /// Check the original independent agreement and immutable signed exports
 /// against the bytes captured *before* signing services were stopped.
 /// Catch silent on-disk rollback, replacement, or mutation after outage.
-fn assert_frozen_recovery_evidence(paths: &[&Path], frozen: &serde_json::Value, manifest: &Path) {
+/// The manifest is pinned byte-for-byte, not only as a parsed JSON value,
+/// so its published SHA-256 identifies exactly one pre-shutdown file.
+fn assert_frozen_recovery_evidence(
+    paths: &[&Path],
+    frozen: &serde_json::Value,
+    manifest: &Path,
+    manifest_bytes: &[u8],
+) {
     assert_eq!(
         &frozen_recovery_evidence(paths),
         frozen,
         "independent terms or signed recovery export changed after service shutdown"
     );
-    let recorded: serde_json::Value = serde_json::from_slice(
-        &fs::read(manifest).expect("read pre-shutdown frozen-evidence manifest"),
-    ).expect("parse pre-shutdown frozen-evidence manifest");
-    assert_eq!(&recorded, frozen, "frozen-evidence manifest changed after shutdown");
+    let current = fs::read(manifest).expect("read pre-shutdown frozen-evidence manifest");
+    assert!(current == manifest_bytes, "frozen-evidence manifest bytes changed after shutdown");
+    let recorded: serde_json::Value = serde_json::from_slice(manifest_bytes)
+        .expect("parse pre-shutdown frozen-evidence manifest");
+    assert_eq!(&recorded, frozen, "frozen-evidence manifest does not describe the frozen files");
+}
+
+/// Write the manifest once and keep its exact bytes in memory as the
+/// reference for every later check.
+fn freeze_manifest(manifest: &Path, frozen: &serde_json::Value) -> Vec<u8> {
+    save_json(manifest, frozen);
+    fs::read(manifest).expect("read back new frozen-evidence manifest")
 }
 
 #[test]
@@ -193,28 +308,37 @@ fn frozen_evidence_guard_rejects_substitution_and_manifest_rewrites() {
     let paths = [terms.as_path(), alice.as_path(), bob.as_path()];
     let frozen = frozen_recovery_evidence(&paths);
     let manifest = dir.join("frozen-evidence-before-shutdown.json");
-    save_json(&manifest, &frozen);
-    assert_frozen_recovery_evidence(&paths, &frozen, &manifest);
+    let manifest_bytes = freeze_manifest(&manifest, &frozen);
+    assert_frozen_recovery_evidence(&paths, &frozen, &manifest, &manifest_bytes);
 
     for path in &paths {
         let original = fs::read(path).unwrap();
         fs::write(path, b"{\"synthetic\":\"altered\"}\n").unwrap();
         assert!(
             std::panic::catch_unwind(|| {
-                assert_frozen_recovery_evidence(&paths, &frozen, &manifest)
+                assert_frozen_recovery_evidence(&paths, &frozen, &manifest, &manifest_bytes)
             }).is_err(),
             "substituted original file unexpectedly passed frozen-evidence check"
         );
         fs::write(path, original).unwrap();
-        assert_frozen_recovery_evidence(&paths, &frozen, &manifest);
+        assert_frozen_recovery_evidence(&paths, &frozen, &manifest, &manifest_bytes);
     }
-    fs::write(&manifest, b"{\"schema\":1,\"files\":[]}\n").unwrap();
-    assert!(
-        std::panic::catch_unwind(|| {
-            assert_frozen_recovery_evidence(&paths, &frozen, &manifest)
-        }).is_err(),
-        "rewritten evidence manifest unexpectedly passed frozen-evidence check"
-    );
+    // A forged manifest, and a re-serialised copy that parses to the same
+    // JSON value, must both fail: the published digest names exact bytes.
+    for rewrite in [
+        b"{\"schema\":1,\"files\":[]}\n".to_vec(),
+        serde_json::to_vec(&frozen).unwrap(),
+    ] {
+        fs::write(&manifest, &rewrite).unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_frozen_recovery_evidence(&paths, &frozen, &manifest, &manifest_bytes)
+            }).is_err(),
+            "rewritten evidence manifest unexpectedly passed frozen-evidence check"
+        );
+    }
+    fs::write(&manifest, &manifest_bytes).unwrap();
+    assert_frozen_recovery_evidence(&paths, &frozen, &manifest, &manifest_bytes);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -459,7 +583,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     ];
     let frozen = frozen_recovery_evidence(&frozen_paths);
     let frozen_manifest = artifact_dir.join("frozen-evidence-before-shutdown.json");
-    save_json(&frozen_manifest, &frozen);
+    let frozen_manifest_bytes = freeze_manifest(&frozen_manifest, &frozen);
 
     // The Ark service and Sapio signing service now disappear. From this
     // point on each claimant reopens solely its persisted seed and unsigned/
@@ -472,7 +596,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     drop(bob);
     tee.stop().await.unwrap();
     srv.stop().await.unwrap();
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err(),
         "Sapio local-dev signing API still answers after shutdown");
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
@@ -489,7 +613,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     recover_offline(&ctx, "external-recovery-fees", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
 
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
 
     // Reach an independently chosen 6-confirmation policy before redemption.
     ctx.bitcoind().generate(6).await;
@@ -523,7 +647,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
         .expect("supply the two-holder regtest PSBT spender Python path"));
     let combined = artifact_dir.join("both-signed-recoveries.json");
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     run_fixture_executable(&merger, &[
         alice_file.as_os_str(), bob_file.as_os_str(),
         terms_file.as_os_str(), combined.as_os_str(),
@@ -576,7 +700,7 @@ async fn sapio_real_two_holder_offline_recovery() {
         assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
             .confirmations.unwrap_or(0) >= 1);
     }
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     fs::remove_file(cli).unwrap();
 }
 
@@ -716,7 +840,9 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     ];
     let frozen = frozen_recovery_evidence(&frozen_paths);
     let frozen_manifest = dir.join("frozen-evidence-before-shutdown.json");
-    save_json(&frozen_manifest, &frozen);
+    let frozen_manifest_bytes = freeze_manifest(&frozen_manifest, &frozen);
+    let holders = [("alice", &bundle_a), ("bob", &bundle_b)];
+    assert_unpublished(&ctx, &holders);
     drop(coordinator_a);
     drop(coordinator_b);
 
@@ -731,9 +857,25 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     drop(sender);
     tee.stop().await.unwrap();
     srv.stop().await.unwrap();
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
-    assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err());
-    assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err());
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err(),
+        "Sapio local-dev signing API still answers after shutdown");
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
+        "Sapio local-dev signing oracle still answers after shutdown");
+    // Record the chain tip once every signer and owner SDK is gone. Each
+    // saved recovery transaction must later confirm strictly above it.
+    assert_unpublished(&ctx, &holders);
+    let shutdown_height = ctx.bitcoind().sync_client().get_block_count().unwrap();
+    save_json(&dir.join("shutdown-before-recovery.json"), &json!({
+        "stopped_in_order": [
+            "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk",
+            "sapio-tee", "captaind",
+        ],
+        "sapio_api_8000_refused": true,
+        "sapio_oracle_8367_refused": true,
+        "signed_recovery_transactions_unpublished": true,
+        "bitcoin_height_at_shutdown": shutdown_height,
+    }));
 
     recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
@@ -745,7 +887,7 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
     ctx.bitcoind().generate(6).await;
 
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
 
     let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER")
         .expect("build the pinned merged-bundle verifier"));
@@ -754,7 +896,7 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let spender = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_PY")
         .expect("supply independent Bitcoin Core PSBT spend runner"));
     let merged = dir.join("both-signed-recoveries.json");
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     run_fixture_executable(&merger, &[
         alice_file.as_os_str(), bob_file.as_os_str(),
         terms_file.as_os_str(), merged.as_os_str()
@@ -778,14 +920,29 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let recovery_anchors = selected_recovery_anchors(&[&bundle_a, &bundle_b]);
     require_external_fee_wallet_funding(&ctx, &alice_fee_child, &sponsor_coins, &recovery_anchors);
     require_external_fee_wallet_funding(&ctx, &bob_fee_child, &sponsor_coins, &recovery_anchors);
+    let recovery_chain = confirmed_recovery_chain(
+        &ctx, &holders, shutdown_height, &sponsor_coins, &recovery_anchors);
+    // The sibling claims descend from one signed transaction that both
+    // exports carry, which spends the single funded root.
+    assert!(recovery_chain.iter().any(|row| row["role"] == "ancestor"
+            && row["used_by"] == json!(["alice", "bob"])),
+        "Alice's and Bob's recoveries share no signed ancestor");
+    let anchor_value = ctx.bitcoind().sync_client()
+        .get_raw_transaction(&anchor.txid, None)
+        .expect("shared chain anchor is missing from Bitcoin Core")
+        .output[anchor.vout as usize].value;
+    assert!(anchor_value >= sat(100_000), "common root cannot back both claims");
     let fee_proof = json!({
         "alice": alice_fee_child,
         "bob": bob_fee_child,
         "external_fee_wallet": "external-recovery-fees",
         "external_fee_wallet_keys_distinct_from_holders": true,
         "shared_chain_anchor": anchor.to_string(),
+        "shared_chain_anchor_sats": anchor_value.to_sat(),
         "real_common_root": true,
-        "services_offline_when_fee_children_mined": true
+        "services_offline_when_fee_children_mined": true,
+        "bitcoin_height_at_shutdown": shutdown_height,
+        "recovery_transactions": recovery_chain,
     });
     save_json(&dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
 
@@ -808,7 +965,27 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let receipt: serde_json::Value = serde_json::from_slice(&redemption.stdout).unwrap();
     assert_eq!(receipt["independent_spends_confirmed"], true);
     assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
+    // Each Bitcoin Core wallet spent exactly its own recovered payout in a
+    // distinct mined transaction.
+    let rpc = ctx.bitcoind().sync_client();
+    let mut redemption_txids = HashSet::new();
+    for holder in report["two_holder"]["holders"].as_array().unwrap() {
+        let name = holder["holder"].as_str().unwrap();
+        let payout: OutPoint = holder["payout_outpoint"].as_str().unwrap().parse().unwrap();
+        let row = receipt["redemptions"].as_array().unwrap().iter()
+            .find(|row| row["holder"] == name).expect("holder has no redemption");
+        assert_eq!(row["wallet"], format!("{name}-recovered"));
+        let txid: bitcoin::Txid = row["txid"].as_str().unwrap().parse().unwrap();
+        assert!(redemption_txids.insert(txid), "both holders share one redemption");
+        let mined = rpc.get_raw_transaction(&txid, None).unwrap();
+        assert_eq!(mined.compute_wtxid().to_string(), row["wtxid"].as_str().unwrap());
+        assert_eq!(mined.input.len(), 1);
+        assert_eq!(mined.input[0].previous_output, payout, "{name} spent another coin");
+        assert!(!mined.input[0].witness.is_empty(), "{name}'s wallet produced no signature");
+        assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
+            .confirmations.unwrap_or(0) >= 1);
+    }
     save_json(&dir.join("two-holder-redemptions.json"), &receipt);
-    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest);
+    assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     fs::remove_file(cli).unwrap();
 }

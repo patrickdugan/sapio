@@ -40,6 +40,7 @@ if [[ -e "$CAPTURE_DIR/alice-recovery.json" || -e "$CAPTURE_DIR/bob-recovery.jso
     echo "Capture directory already holds signed exports. Choose a fresh SAPLING_TWO_HOLDER_CAPTURE_DIR" >&2
     exit 1
 fi
+echo "==> stage: auditor-build"
 TARGET_DIR="${SAPLING_TWO_HOLDER_TARGET_DIR:-$REPO/contrib/sapling-vtxo-entitlements/target}"
 cargo build --locked --manifest-path "$MANIFEST" --bins --target-dir "$TARGET_DIR"
 MERGER="$TARGET_DIR/debug/merge-bundles"
@@ -81,10 +82,12 @@ cd "$WORKTREE"
 # Execute the same Rust freeze guard against forged saved evidence before
 # spending time running the service-loss fixture. The pinned build artifacts
 # remain in this worktree and are reused for the real test below.
+echo "==> stage: freeze-guard (pinned SDK test build + adversarial evidence check)"
 ./contrib/sapio-e2e.sh frozen_evidence_guard_rejects_substitution_and_manifest_rewrites
 
 # The upstream recipe validates real-service dependencies and creates a
 # private network namespace if the platform supports bubblewrap isolation.
+echo "==> stage: service-loss recovery ($TEST_FILTER)"
 ./contrib/sapio-e2e.sh "$TEST_FILTER"
 
 test -s "$CAPTURE_DIR/two-holder-pre-spend-report.json"
