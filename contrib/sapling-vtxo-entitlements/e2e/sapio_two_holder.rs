@@ -832,8 +832,23 @@ async fn sapio_real_two_holder_offline_recovery() {
 
 #[tokio::test]
 async fn sapio_real_common_anchor_two_holder_recovery() {
+    common_anchor_fixture(false).await;
+}
+
+/// Adversarial negative control: the prior program owner saves a signed exit
+/// before the two-holder transfer, then publishes it after both services die.
+#[tokio::test]
+async fn sapio_real_stale_sender_recovery_race() {
+    common_anchor_fixture(true).await;
+}
+
+async fn common_anchor_fixture(stale_sender_attack: bool) {
     let _exclusive = TEE_LOCK.lock().await;
-    let ctx = TestContext::new("sapling_sdk/sapio_real_common_anchor_two_holder_recovery").await;
+    let ctx = TestContext::new(if stale_sender_attack {
+        "sapling_sdk/sapio_real_stale_sender_recovery_race"
+    } else {
+        "sapling_sdk/sapio_real_common_anchor_two_holder_recovery"
+    }).await;
     let tee = SapioTee::launch(&ctx).await;
     let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
         .funded(btc(1)).create().await;
@@ -845,14 +860,39 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         "recovery sponsor must have no Ark VTXOs");
     let sponsor_coins = capture_fee_wallet_funding(&fee_wallet).await;
 
-    // One genuine funded root VTXO is split by sequential native Ark
-    // transfers to two *different* Sapio program-wallet recipients.
-    // Their recovery ancestry is required to share the same chain anchor.
-    let sender = ctx.sdk("sender", &srv).boarded(sat(120_000)).create().await;
+    // In the adversarial run, the initial owner is a genuine program
+    // wallet, allowing its earlier fully signed exit to be frozen before
+    // the same economic root is transferred to Alice and Bob.
+    let stale_script = ctx.bitcoind().get_new_address().script_pubkey();
+    let sender = if stale_sender_attack {
+        let sender_seed = bip39::Mnemonic::generate(12).unwrap();
+        let sender_evidence = sender_seed.clone();
+        let sender_config = config(&tee, lifecycle_program(),
+            recovery(stale_script.clone(), 0u32.to_le_bytes().to_vec()), None);
+        ctx.sdk("sender", &srv).mnemonic(sender_seed).boarded(sat(120_000))
+            .cfg(move |c| configure_wallet(c, sender_config, &sender_evidence))
+            .create().await
+    } else {
+        ctx.sdk("sender", &srv).boarded(sat(120_000)).create().await
+    };
     let original = sender.spendable_vtxos().await.unwrap();
     assert_eq!(original.len(), 1);
     assert_eq!(original[0].amount(), sat(120_000));
     let anchor = original[0].vtxo.chain_anchor();
+    let stale_sender = if stale_sender_attack {
+        let position = original[0].vtxo.point();
+        let saved = sender.program_recovery_bundle(&[position]).await.unwrap();
+        saved.verify().unwrap();
+        assert_eq!(saved.readiness(position).unwrap(), ProgramRecoveryReadiness::Complete);
+        let claim = &saved.recoveries.iter()
+            .find(|r| r.controlled_outpoint == position).unwrap().claim;
+        assert_eq!(claim.output.len(), 2);
+        assert_eq!(claim.output[0].value, sat(120_000));
+        assert_eq!(claim.output[0].script_pubkey, stale_script);
+        Some((position, saved))
+    } else {
+        None
+    };
     drop(original);
 
     let (alice_core, alice_script) = new_recipient_wallet(&ctx, "alice-recovered");
