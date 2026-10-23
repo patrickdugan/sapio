@@ -381,8 +381,9 @@ its actual Bitcoin chain anchor. It then runs both independently
 saved recovery exports through the same cross-target backing auditor
 and requires separate confirmed wallet redemptions after service
 shutdown. Any remaining 20,000 sats in the parent wallet remain outside
-these two selected claims. This scenario is **experimental until the
-pinned real-service suite runs successfully**.
+these two selected claims. The pinned real-service suite first passed this
+scenario at `18f6802` in run 39927925655; see [COMMON_ROOT_EVIDENCE.md](COMMON_ROOT_EVIDENCE.md)
+for the receipt, its trust assumptions and what it does not establish.
 
 The driver also accepts `SAPLING_TWO_HOLDER_CAPTURE_DIR`; otherwise it
 chooses a new private directory under the user's local state home.
