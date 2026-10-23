@@ -221,6 +221,50 @@ fn assert_unpublished(ctx: &TestContext, holders: &[(&str, &ProgramRecoveryBundl
     }
 }
 
+/// Record the chain tip once every signer and owner SDK is gone, after the
+/// Sapio ports were found closed. Each saved recovery transaction must later
+/// confirm strictly above the returned height.
+fn record_shutdown(
+    ctx: &TestContext,
+    dir: &Path,
+    holders: &[(&str, &ProgramRecoveryBundle)],
+    stopped_in_order: &[&str],
+) -> u64 {
+    assert_unpublished(ctx, holders);
+    let shutdown_height = ctx.bitcoind().sync_client().get_block_count().unwrap();
+    save_json(&dir.join("shutdown-before-recovery.json"), &json!({
+        "stopped_in_order": stopped_in_order,
+        "sapio_api_8000_refused": true,
+        "sapio_oracle_8367_refused": true,
+        "signed_recovery_transactions_unpublished": true,
+        "bitcoin_height_at_shutdown": shutdown_height,
+    }));
+    shutdown_height
+}
+
+/// Each Bitcoin Core wallet spent exactly its own recovered payout in a
+/// distinct, wallet-signed, mined transaction.
+fn verify_redemptions(ctx: &TestContext, report: &serde_json::Value, receipt: &serde_json::Value) {
+    let rpc = ctx.bitcoind().sync_client();
+    let mut redemption_txids = HashSet::new();
+    for holder in report["two_holder"]["holders"].as_array().unwrap() {
+        let name = holder["holder"].as_str().unwrap();
+        let payout: OutPoint = holder["payout_outpoint"].as_str().unwrap().parse().unwrap();
+        let row = receipt["redemptions"].as_array().unwrap().iter()
+            .find(|row| row["holder"] == name).expect("holder has no redemption");
+        assert_eq!(row["wallet"], format!("{name}-recovered"));
+        let txid: bitcoin::Txid = row["txid"].as_str().unwrap().parse().unwrap();
+        assert!(redemption_txids.insert(txid), "both holders share one redemption");
+        let mined = rpc.get_raw_transaction(&txid, None).unwrap();
+        assert_eq!(mined.compute_wtxid().to_string(), row["wtxid"].as_str().unwrap());
+        assert_eq!(mined.input.len(), 1);
+        assert_eq!(mined.input[0].previous_output, payout, "{name} spent another coin");
+        assert!(!mined.input[0].witness.is_empty(), "{name}'s wallet produced no signature");
+        assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
+            .confirmations.unwrap_or(0) >= 1);
+    }
+}
+
 /// After recovery: each saved ancestor and claim is confirmed with exactly
 /// its saved bytes (witnesses included), above the recorded shutdown height,
 /// beside exactly one mined P2A fee child whose external inputs trace back
@@ -565,6 +609,11 @@ async fn sapio_real_two_holder_offline_recovery() {
     assert_ne!(alice_point, bob_point);
     assert_eq!(alice_positions[0].amount(), sat(60_000));
     assert_eq!(bob_positions[0].amount(), sat(40_000));
+    // Separately boarded: each position has its own on-chain funding root,
+    // so neither holder's recovery can depend on the other's ancestry.
+    let alice_anchor = alice_positions[0].vtxo.chain_anchor();
+    let bob_anchor = bob_positions[0].vtxo.chain_anchor();
+    assert_ne!(alice_anchor, bob_anchor, "separately boarded VTXOs share a funding root");
 
     // Independent terms originate from the configured, running signer and
     // owner VTXO state, BEFORE asking either wallet for a recovery export.
@@ -634,6 +683,8 @@ async fn sapio_real_two_holder_offline_recovery() {
     let frozen = frozen_recovery_evidence(&frozen_paths);
     let frozen_manifest = artifact_dir.join("frozen-evidence-before-shutdown.json");
     let frozen_manifest_bytes = freeze_manifest(&frozen_manifest, &frozen);
+    let holders = [("alice", &bundle_a), ("bob", &bundle_b)];
+    assert_unpublished(&ctx, &holders);
 
     // The Ark service and Sapio signing service now disappear. From this
     // point on each claimant reopens solely its persisted seed and unsigned/
@@ -651,14 +702,19 @@ async fn sapio_real_two_holder_offline_recovery() {
         "Sapio local-dev signing API still answers after shutdown");
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
         "Sapio local-dev signing oracle still answers after shutdown");
+    let shutdown_height = record_shutdown(&ctx, &artifact_dir, &holders, &[
+        "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sapio-tee", "captaind",
+    ]);
 
     // Confirm Alice without Bob's wallet; then confirm Bob independently.
     // Both use the pinned SDK's ordinary, externally funded fee wallet and
     // validate exact P2A children, native CSV/CLTV and Bitcoin Core confirmations.
     recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
+    let claim_txid = |bundle: &ProgramRecoveryBundle| bundle.recoveries.iter()
+        .find(|r| r.controlled_outpoint == bundle.targets[0]).unwrap().claim.compute_txid();
     assert!(ctx.bitcoind().sync_client()
-        .get_raw_transaction(&bundle_b.recoveries[0].claim.compute_txid(), None).is_err(),
+        .get_raw_transaction(&claim_txid(&bundle_b), None).is_err(),
         "Bob's recovery published without Bob initiating recovery");
     recover_offline(&ctx, "external-recovery-fees", Some(&bob_file), &bundle_b).await;
     assert_saved_claim(&ctx, &bundle_b, bob_point, &bob_script, sat(40_000));
@@ -668,8 +724,7 @@ async fn sapio_real_two_holder_offline_recovery() {
     // Reach an independently chosen 6-confirmation policy before redemption.
     ctx.bitcoind().generate(6).await;
     for bundle in [&bundle_a, &bundle_b] {
-        let txid = bundle.recoveries[0].claim.compute_txid();
-        assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
+        assert!(ctx.bitcoind().transaction_confirmation(claim_txid(bundle)).unwrap()
             .confirmations.unwrap_or(0) >= 6);
     }
 
@@ -678,12 +733,36 @@ async fn sapio_real_two_holder_offline_recovery() {
     let recovery_anchors = selected_recovery_anchors(&[&bundle_a, &bundle_b]);
     require_external_fee_wallet_funding(&ctx, &alice_fee_child, &sponsor_coins, &recovery_anchors);
     require_external_fee_wallet_funding(&ctx, &bob_fee_child, &sponsor_coins, &recovery_anchors);
+    let recovery_chain = confirmed_recovery_chain(
+        &ctx, &holders, shutdown_height, &sponsor_coins, &recovery_anchors);
+    // Separate roots: no signed recovery transaction serves both holders,
+    // and each funding root alone backs its holder's agreed amount.
+    assert!(recovery_chain.iter().all(|row| row["used_by"].as_array().unwrap().len() == 1),
+        "separately boarded recoveries share a signed transaction");
+    let rpc = ctx.bitcoind().sync_client();
+    let mut chain_anchors = serde_json::Map::new();
+    for (holder, anchor, agreed) in [
+        ("alice", alice_anchor, sat(60_000)), ("bob", bob_anchor, sat(40_000)),
+    ] {
+        let value = rpc.get_raw_transaction(&anchor.txid, None)
+            .expect("holder's funding root is missing from Bitcoin Core")
+            .output[anchor.vout as usize].value;
+        assert!(value >= agreed, "{holder}'s funding root cannot back its claim");
+        chain_anchors.insert(holder.into(), json!({
+            "outpoint": anchor.to_string(), "sats": value.to_sat(),
+        }));
+    }
     let fee_proof = json!({
         "alice": alice_fee_child,
         "bob": bob_fee_child,
         "external_fee_wallet": "external-recovery-fees",
         "external_fee_wallet_keys_distinct_from_holders": true,
+        "real_common_root": false,
+        "separate_roots": true,
+        "chain_anchors": chain_anchors,
         "services_offline_when_fee_children_mined": true,
+        "bitcoin_height_at_shutdown": shutdown_height,
+        "recovery_transactions": recovery_chain,
     });
     save_json(&artifact_dir.join("confirmed-p2a-fee-children.json"), &fee_proof);
 
@@ -711,6 +790,8 @@ async fn sapio_real_two_holder_offline_recovery() {
     ]);
     let report: serde_json::Value = serde_json::from_slice(&audit.stdout)
         .expect("auditor returned invalid JSON");
+    assert_eq!(report["offline"]["total_protected_sats"], 100_000);
+    assert_eq!(report["offline"]["selected_paths_nonconflicting"], true);
     assert_eq!(report["two_holder"]["total_payout_sats"], 100_000);
     assert_eq!(report["two_holder"]["holders"].as_array().unwrap().len(), 2);
     let report_file = artifact_dir.join("two-holder-pre-spend-report.json");
@@ -741,17 +822,10 @@ async fn sapio_real_two_holder_offline_recovery() {
     set_recipient_wallets_loaded(&ctx, &["alice-recovered", "bob-recovered"], false);
     assert_eq!(receipt["independent_spends_confirmed"], true);
     assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
-    save_json(&artifact_dir.join("two-holder-redemptions.json"), &receipt);
-
     // Earlier reports must remain separate from post-spend reports: both
     // recovered payout UTXOs have deliberately left the UTXO set.
-    for holder in ["alice", "bob"] {
-        let redemption = receipt["redemptions"].as_array().unwrap()
-            .iter().find(|row| row["holder"] == holder).unwrap();
-        let txid: bitcoin::Txid = redemption["txid"].as_str().unwrap().parse().unwrap();
-        assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
-            .confirmations.unwrap_or(0) >= 1);
-    }
+    verify_redemptions(&ctx, &report, &receipt);
+    save_json(&artifact_dir.join("two-holder-redemptions.json"), &receipt);
     assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     fs::remove_file(cli).unwrap();
 }
@@ -918,20 +992,10 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         "Sapio local-dev signing API still answers after shutdown");
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
         "Sapio local-dev signing oracle still answers after shutdown");
-    // Record the chain tip once every signer and owner SDK is gone. Each
-    // saved recovery transaction must later confirm strictly above it.
-    assert_unpublished(&ctx, &holders);
-    let shutdown_height = ctx.bitcoind().sync_client().get_block_count().unwrap();
-    save_json(&dir.join("shutdown-before-recovery.json"), &json!({
-        "stopped_in_order": [
-            "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk",
-            "sapio-tee", "captaind",
-        ],
-        "sapio_api_8000_refused": true,
-        "sapio_oracle_8367_refused": true,
-        "signed_recovery_transactions_unpublished": true,
-        "bitcoin_height_at_shutdown": shutdown_height,
-    }));
+    let shutdown_height = record_shutdown(&ctx, &dir, &holders, &[
+        "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk",
+        "sapio-tee", "captaind",
+    ]);
 
     recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));
@@ -1023,26 +1087,7 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     set_recipient_wallets_loaded(&ctx, &["alice-recovered", "bob-recovered"], false);
     assert_eq!(receipt["independent_spends_confirmed"], true);
     assert_eq!(receipt["redemptions"].as_array().unwrap().len(), 2);
-    // Each Bitcoin Core wallet spent exactly its own recovered payout in a
-    // distinct mined transaction.
-    let rpc = ctx.bitcoind().sync_client();
-    let mut redemption_txids = HashSet::new();
-    for holder in report["two_holder"]["holders"].as_array().unwrap() {
-        let name = holder["holder"].as_str().unwrap();
-        let payout: OutPoint = holder["payout_outpoint"].as_str().unwrap().parse().unwrap();
-        let row = receipt["redemptions"].as_array().unwrap().iter()
-            .find(|row| row["holder"] == name).expect("holder has no redemption");
-        assert_eq!(row["wallet"], format!("{name}-recovered"));
-        let txid: bitcoin::Txid = row["txid"].as_str().unwrap().parse().unwrap();
-        assert!(redemption_txids.insert(txid), "both holders share one redemption");
-        let mined = rpc.get_raw_transaction(&txid, None).unwrap();
-        assert_eq!(mined.compute_wtxid().to_string(), row["wtxid"].as_str().unwrap());
-        assert_eq!(mined.input.len(), 1);
-        assert_eq!(mined.input[0].previous_output, payout, "{name} spent another coin");
-        assert!(!mined.input[0].witness.is_empty(), "{name}'s wallet produced no signature");
-        assert!(ctx.bitcoind().transaction_confirmation(txid).unwrap()
-            .confirmations.unwrap_or(0) >= 1);
-    }
+    verify_redemptions(&ctx, &report, &receipt);
     save_json(&dir.join("two-holder-redemptions.json"), &receipt);
     assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     fs::remove_file(cli).unwrap();
