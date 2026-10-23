@@ -78,6 +78,11 @@ echo "Pinned SaplingOS revision: $PIN"
 echo "Capture directory: $CAPTURE_DIR"
 cd "$WORKTREE"
 
+# Execute the same Rust freeze guard against forged saved evidence before
+# spending time running the service-loss fixture. The pinned build artifacts
+# remain in this worktree and are reused for the real test below.
+./contrib/sapio-e2e.sh frozen_evidence_guard_rejects_substitution_and_manifest_rewrites
+
 # The upstream recipe validates real-service dependencies and creates a
 # private network namespace if the platform supports bubblewrap isolation.
 ./contrib/sapio-e2e.sh "$TEST_FILTER"
