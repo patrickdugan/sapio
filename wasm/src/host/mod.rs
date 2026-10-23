@@ -8,4 +8,6 @@ pub use crypto::{
     BIP32_CHILD_FUEL, SCHNORR_VERIFY_FUEL, SCHNORR_VERIFY_V2_BASE_FUEL,
     SCHNORR_VERIFY_V2_BYTE_FUEL, SHA256_BASE_FUEL, SHA256_BYTE_FUEL, XONLY_TWEAK_CHECK_FUEL,
 };
-pub use runtime::{new_evaluator_store, new_store, store_with_fuel, INSTANCE_FUEL};
+pub use runtime::{
+    new_evaluator_store, new_store, store_with_fuel, COMPILER_INSTANCE_FUEL, INSTANCE_FUEL,
+};
