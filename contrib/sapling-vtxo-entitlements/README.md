@@ -319,8 +319,18 @@ Copy the `export` assignments printed by both scripts into the same shell
 before running `run_real_two_holder.sh`. The second bootstrap pins
 `stutxo/saplingos@b45e5ef`, `ark-bitcoin/bark@626c9b`, and
 `BoltzExchange/hold@af0055`, compiles the Bark server/watchman and the
-hold plugin, and verifies release hashes of Bitcoin Core 30.3 and Core
+hold plugin, and verifies release hashes of Bitcoin Core 31.0 and Core
 Lightning 26.06.7. The Lightning release's gRPC plugin is included.
+The pinned `captaind` refuses Bitcoin Core older than v31
+(`MIN_BITCOIND_VERSION` in Bark's `server/src/bitcoind.rs`), and Bark's
+own dev shell uses 31.0. The 31.0 archive digest
+`d3e4c58a35b1d0a97a457462c94f55501ad167c660c245cb1ffa565641c65074`
+matches bitcoincore.org's `SHA256SUMS` and the fanquake, achow101, Sjors
+and Emzy attestations in
+[guix.sigs@3962bb94](https://github.com/bitcoin-core/guix.sigs/tree/3962bb942102c4bc242d08a137e31b9a74cf8fbe/31.0).
+Inside the pinned SaplingOS dev shell, `run_real_two_holder.sh` starts the
+distribution-linked PostgreSQL and Core Lightning binaries through
+wrappers that clear the shell's Nix `LD_LIBRARY_PATH`.
 The preflight job checks the public source revisions and official CLN
 archive layout. Its checksum is sourced from that release's GitHub
 asset digest. Rebuilding service binaries may consume substantial CPU

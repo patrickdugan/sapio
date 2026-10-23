@@ -60,11 +60,35 @@ def chunks(title, text):
         yield title, text[start:start + MAX_CHARS]
 
 
+def daemon_logs(root, tail):
+    """Annotate the newest fixture daemon stderr/stdout logs under root.
+
+    Bark's harness only reports "stopped running before initialization";
+    the daemon's own reason is in stderr.log/stdout.log in its datadir.
+    """
+    logs = [p for p in root.rglob("*.log") if p.name in ("stderr.log", "stdout.log")]
+    logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    emitted = 0
+    for path in logs:
+        lines = [clean(line) for line in path.read_text(
+            encoding="utf-8", errors="replace").splitlines()[-tail:]]
+        if not any(lines) or emitted == MAX_ANNOTATIONS:
+            continue
+        title = "daemon " + str(path.relative_to(root))
+        print(f"::error title={escape(title)}::{escape(chr(10).join(lines)[-MAX_CHARS:])}")
+        emitted += 1
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path)
     parser.add_argument("--tail", type=int, default=60)
+    parser.add_argument("--daemon-logs", action="store_true",
+                        help="treat LOG as a test directory and annotate daemon logs")
     args = parser.parse_args()
+    if args.daemon_logs:
+        return daemon_logs(args.log, 25)
     raw = args.log.read_text(encoding="utf-8", errors="replace").splitlines()
     lines = [clean(line) for line in raw]
 

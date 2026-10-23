@@ -181,6 +181,13 @@ jobs:
           python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
             "$RUNNER_TEMP/real-regtest.log" || true
 
+      - name: Publish fixture daemon log tails as annotations
+        if: failure()
+        run: |
+          [[ -d "$RUNNER_TEMP/saplingos-e2e-datadirs" ]] || exit 0
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            --daemon-logs "$RUNNER_TEMP/saplingos-e2e-datadirs" || true
+
       - name: Measure fixture cache before saving
         if: always() && steps.regtest.outcome != 'skipped'
         run: |

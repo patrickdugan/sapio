@@ -5,9 +5,12 @@ set -euo pipefail
 SDK_PIN=b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
 BARK_PIN=626c9b241dd25d73212915d8fca959ab5e3b8f1f
 HOLD_PIN=af0055b132f3b9f24d0b1d478a15005fcf8f014f
-CORE_SHA=4753cd70416c629a2090503e8545a3c05e94a0f5037f8fb97b4c35c6e1afee0e
+CORE_SHA=d3e4c58a35b1d0a97a457462c94f55501ad167c660c245cb1ffa565641c65074
 CLN_SHA=b09f4ed81628d4d60d9f9096f85dcae9533290f3ed409097e95f8d7414acd9c8
-CORE_URL=https://bitcoincore.org/bin/bitcoin-core-30.3/bitcoin-30.3-x86_64-linux-gnu.tar.gz
+# Pinned Bark 626c9b captaind refuses Bitcoin Core < 31 (server/src/bitcoind.rs
+# MIN_BITCOIND_VERSION); its own dev shell uses 31.0. Hash matches bitcoincore.org
+# SHA256SUMS and guix.sigs@3962bb94 (fanquake, achow101, Sjors, Emzy).
+CORE_URL=https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-x86_64-linux-gnu.tar.gz
 CLN_URL=https://github.com/ElementsProject/lightning/releases/download/v26.06.7/clightning-v26.06.7-Ubuntu-24.04-amd64.tar.xz
 
 [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || {
@@ -67,7 +70,7 @@ checkout_pinned https://github.com/stutxo/saplingos.git "$SDK_PIN" "$SDK"
 checkout_pinned https://github.com/ark-bitcoin/bark.git "$BARK_PIN" "$BARK"
 checkout_pinned https://github.com/BoltzExchange/hold.git "$HOLD_PIN" "$HOLD"
 
-CORE="$ROOT/bitcoin-30.3-x86_64-linux-gnu.tar.gz"
+CORE="$ROOT/bitcoin-31.0-x86_64-linux-gnu.tar.gz"
 CLN="$ROOT/clightning-v26.06.7-Ubuntu-24.04-amd64.tar.xz"
 [[ -f "$CORE" ]] || curl --proto '=https' --tlsv1.2 -fsSLo "$CORE" "$CORE_URL"
 [[ -f "$CLN" ]] || curl --proto '=https' --tlsv1.2 -fsSLo "$CLN" "$CLN_URL"
@@ -77,8 +80,8 @@ printf '%s  %s\n' "$CLN_SHA" "$CLN" | sha256sum --check
 mkdir -p "$ROOT/core-release" "$ROOT/cln-release"
 tar -xzf "$CORE" -C "$ROOT/core-release"
 tar -xJf "$CLN" -C "$ROOT/cln-release"
-BITCOIND="$ROOT/core-release/bitcoin-30.3/bin/bitcoind"
-BITCOIN_CLI="$ROOT/core-release/bitcoin-30.3/bin/bitcoin-cli"
+BITCOIND="$ROOT/core-release/bitcoin-31.0/bin/bitcoind"
+BITCOIN_CLI="$ROOT/core-release/bitcoin-31.0/bin/bitcoin-cli"
 [[ -x "$BITCOIND" && -x "$BITCOIN_CLI" ]] || {
     echo "Unexpected official Bitcoin Core tar layout." >&2
     exit 1
