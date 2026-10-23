@@ -455,9 +455,13 @@ fn fixture_bitcoin_cli(ctx: &TestContext) -> PathBuf {
     wrapper
 }
 
+/// The merger, auditor, Python spender and bitcoin-cli are host programs.
+/// Drop the pinned Nix dev shell's LD_LIBRARY_PATH so they never load Nix
+/// OpenSSL/SQLite libraries against the host glibc.
 fn run_fixture_executable(executable: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
     let output = std::process::Command::new(executable)
-        .args(args).output().expect("run external verifier in integration fixture");
+        .args(args).env_remove("LD_LIBRARY_PATH")
+        .output().expect("run external verifier in integration fixture");
     assert!(output.status.success(), "external fixture command {} failed:\n{}\n{}",
         executable.display(), String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr));
