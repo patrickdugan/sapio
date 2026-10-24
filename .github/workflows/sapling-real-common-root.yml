@@ -21,7 +21,7 @@ concurrency:
 jobs:
   actual-service-recovery:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
@@ -247,6 +247,40 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # The operator is still online while the Sapio signing service has
+      # disappeared. Alice's first signed ancestor confirms before expiry;
+      # the actual Ark watchman then creates fresh sweeps on the live chain.
+      # The sanitized receipt classifies Bob's resulting signed claim.
+      - name: "Scenario: operator watchman expiry sweep during Alice recovery"
+        id: operator
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        env:
+          SAPLING_TWO_HOLDER_CAPTURE_DIR: ${{ runner.temp }}/capture-operator-expiry
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/regtest-operator-expiry.log") 2>&1
+          bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
+            sapio_real_operator_expiry_sweep_alice_in_flight
+          echo "==> stage: complete"
+
+      - name: Verify signed-input conflicts with frozen Alice/Bob and publish operator receipt
+        id: proof-operator
+        if: ${{ !cancelled() && steps.operator.outcome == 'success' }}
+        env:
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          bash contrib/sapling-vtxo-entitlements/scripts/publish_public_proof.sh \
+            operator-expiry "$RUNNER_TEMP/capture-operator-expiry" public-regtest-proof-operator-expiry.json
+
+      - name: Preserve only non-secret live operator sweep evidence
+        if: ${{ !cancelled() && steps.proof-operator.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: saplingos-real-operator-expiry-sweep-proof
+          path: public-regtest-proof-operator-expiry.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Annotate bootstrap failure
         if: ${{ always() && steps.bootstrap.outcome == 'failure' }}
         run: |
@@ -270,6 +304,12 @@ jobs:
         run: |
           python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
             "$RUNNER_TEMP/regtest-stale-race.log" || true
+
+      - name: Annotate operator expiry race failure
+        if: ${{ always() && steps.operator.outcome == 'failure' }}
+        run: |
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            "$RUNNER_TEMP/regtest-operator-expiry.log" || true
 
       - name: Publish fixture daemon log tails as annotations
         if: failure()
