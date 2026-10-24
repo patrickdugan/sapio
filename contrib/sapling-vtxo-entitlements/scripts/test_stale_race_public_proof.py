@@ -32,7 +32,17 @@ class StaleRaceProofTest(unittest.TestCase):
         root = Path(self.tmp.name)
         for item in root.iterdir():
             item.unlink()
-        contents = {"two-holder-terms.json": b'{"agreed":true}'}
+        terms = {"version": 1, "network": "regtest", "private": "test-only", "targets": [
+            {
+                "outpoint": bundles[name]["targets"][0],
+                "beneficiaries": [{
+                    "holder": name, "sats": sats,
+                    "script_pubkey_hex": key_script(tag),
+                }],
+            }
+            for name, sats, tag in (("alice", 60_000, 10), ("bob", 40_000, 11))
+        ]}
+        contents = {"two-holder-terms.json": json.dumps(terms).encode()}
         for name, bundle_value in bundles.items():
             contents[f"{name}-recovery.json"] = json.dumps(bundle_value).encode()
         files = []
@@ -107,10 +117,39 @@ class StaleRaceProofTest(unittest.TestCase):
         self.assertEqual(proof["observed_claims"]["bob"], "unconfirmed")
         self.assertEqual(proof["shared_chain_anchor_sats"], 120_000)
         self.assertGreater(len(proof["signed_input_conflicts"]), 0)
-        self.assertNotIn('"agreed"', json.dumps(proof))
+        self.assertNotIn('"private"', json.dumps(proof))
 
     def test_corrupted_original_signed_export(self):
         self.rejects(mutate_root=lambda root: (root / "bob-recovery.json").write_text("{}"))
+
+    def test_one_satoshi_wrong_independent_terms(self):
+        def misallocate(root):
+            path = root / "two-holder-terms.json"
+            terms = json.loads(path.read_text())
+            terms["targets"][1]["beneficiaries"][0]["sats"] = 39_999
+            # A true pre-shutdown agreement would hash this altered document.
+            data = json.dumps(terms).encode()
+            path.write_bytes(data)
+            manifest_path = root / "frozen-evidence-before-shutdown.json"
+            manifest = json.loads(manifest_path.read_text())
+            row = next(r for r in manifest["files"] if r["file"] == path.name)
+            row["sha256"], row["bytes"] = hashlib.sha256(data).hexdigest(), len(data)
+            manifest_path.write_text(json.dumps(manifest))
+        self.rejects(mutate_root=misallocate)
+
+    def test_changed_beneficiary_script_in_frozen_terms(self):
+        def redirect(root):
+            path = root / "two-holder-terms.json"
+            terms = json.loads(path.read_text())
+            terms["targets"][0]["beneficiaries"][0]["script_pubkey_hex"] = key_script(77)
+            data = json.dumps(terms).encode()
+            path.write_bytes(data)
+            manifest_path = root / "frozen-evidence-before-shutdown.json"
+            manifest = json.loads(manifest_path.read_text())
+            row = next(r for r in manifest["files"] if r["file"] == path.name)
+            row["sha256"], row["bytes"] = hashlib.sha256(data).hexdigest(), len(data)
+            manifest_path.write_text(json.dumps(manifest))
+        self.rejects(mutate_root=redirect)
 
     def test_altered_stale_sender_root(self):
         self.rejects(mutate_bundle=lambda b: b["stale-sender"]["recoveries"][0].update(
