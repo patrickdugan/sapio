@@ -42,6 +42,70 @@ def signed_inputs(raw_hex):
     return result
 
 
+def signed_outputs(raw_hex):
+    """Read the exact signed value/script outputs, including the P2A anchor."""
+    tx_ids(raw_hex)
+    raw = bytes.fromhex(raw_hex)
+    at = 6 if raw[4:6] == b"\x00\x01" else 4
+    inputs, at = _varint(raw, at)
+    check(0 < inputs <= (len(raw) - at) // 41, "invalid transaction input count")
+    for _ in range(inputs):
+        check(at + 36 <= len(raw), "truncated input")
+        at += 36
+        script_size, at = _varint(raw, at)
+        check(at + script_size + 4 <= len(raw), "truncated input script")
+        at += script_size + 4
+    count, at = _varint(raw, at)
+    check(0 < count <= (len(raw) - at) // 9, "invalid transaction output count")
+    outputs = []
+    for _ in range(count):
+        check(at + 8 <= len(raw), "truncated output value")
+        value = int.from_bytes(raw[at:at + 8], "little")
+        at += 8
+        size, at = _varint(raw, at)
+        check(at + size <= len(raw), "truncated output script")
+        script = raw[at:at + size].hex()
+        at += size
+        outputs.append((value, script))
+    return outputs
+
+
+def check_agreed_payouts(root, paths):
+    """Bind independent two-holder terms to each frozen signed Bitcoin claim."""
+    terms = load(root, "two-holder-terms.json")
+    targets = terms["targets"]
+    check(len(targets) == 2, "exactly two agreed targets required")
+    matched = set()
+    for target in targets:
+        beneficiaries = target["beneficiaries"]
+        check(len(beneficiaries) == 1, "each target must have one unique beneficiary")
+        agreed = beneficiaries[0]
+        name = agreed["holder"]
+        check(name in ALLOCATION and name not in matched, "wrong or repeated holder")
+        matched.add(name)
+        check(target["outpoint"] == paths[name]["target"],
+              name + " signed claim targets a different position")
+        check(agreed["sats"] == ALLOCATION[name], name + " signed entitlement changed")
+        record = next(r for r in load(root, f"{name}-recovery.json")["recoveries"]
+                      if r["controlled_outpoint"] == paths[name]["target"])
+        check(signed_inputs(record["claim"]) == [paths[name]["target"]],
+              name + " signed claim does not spend the selected controlled VTXO")
+        check(signed_outputs(record["claim"]) == [
+            (ALLOCATION[name], agreed["script_pubkey_hex"].lower()),
+            (0, "51024e73"),
+        ], name + " signed claim does not pay the independently agreed script and sats")
+    check(matched == set(ALLOCATION), "missing one agreed holder")
+
+    stale = next(r for r in load(root, "stale-sender-recovery.json")["recoveries"]
+                 if r["controlled_outpoint"] == paths["stale-sender"]["target"])
+    check(signed_inputs(stale["claim"]) == [paths["stale-sender"]["target"]],
+          "old signed claim spends an unrelated input")
+    outputs = signed_outputs(stale["claim"])
+    check(len(outputs) == 2 and outputs[0][0] == 120_000
+          and outputs[1] == (0, "51024e73"),
+          "old sender claim has unexpected value or P2A anchor")
+
+
 def saved_path(root, name):
     bundle = load(root, f"{name}-recovery.json")
     check(len(bundle["targets"]) == 1, f"{name}: expected one selected target")
@@ -105,6 +169,7 @@ def build(root, revisions):
               row["file"] + " changed after pre-shutdown freeze")
 
     paths = {name: saved_path(root, name) for name in PARTICIPANTS}
+    check_agreed_payouts(root, paths)
     check(len({paths[n]["anchor"] for n in PARTICIPANTS}) == 1,
           "stale sender and new holders do not share an on-chain root")
     check(len({paths[n]["anchor_sats"] for n in PARTICIPANTS}) == 1,
