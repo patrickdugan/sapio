@@ -7,7 +7,11 @@ set -euo pipefail
 SCENARIO="$1" CAPTURE="$2" OUTPUT="$3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-python3 "$SCRIPT_DIR/write_public_proof.py" "$CAPTURE" "$OUTPUT" \
+WRITER="$SCRIPT_DIR/write_public_proof.py"
+if [[ "$SCENARIO" == "stale-race" ]]; then
+    WRITER="$SCRIPT_DIR/write_stale_race_public_proof.py"
+fi
+python3 "$WRITER" "$CAPTURE" "$OUTPUT" \
     --scenario "$SCENARIO" \
     --revision sdk_revision=b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d \
     --revision tee_revision=f083bdbd2343aad22fab861f1565c0f2c2e6b0af \
