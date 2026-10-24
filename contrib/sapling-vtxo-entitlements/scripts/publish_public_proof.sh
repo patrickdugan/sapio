@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WRITER="$SCRIPT_DIR/write_public_proof.py"
 if [[ "$SCENARIO" == "stale-race" ]]; then
     WRITER="$SCRIPT_DIR/write_stale_race_public_proof.py"
+elif [[ "$SCENARIO" == "operator-expiry" ]]; then
+    WRITER="$SCRIPT_DIR/write_operator_expiry_public_proof.py"
 fi
 python3 "$WRITER" "$CAPTURE" "$OUTPUT" \
     --scenario "$SCENARIO" \

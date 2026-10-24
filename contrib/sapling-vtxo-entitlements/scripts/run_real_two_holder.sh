@@ -7,7 +7,7 @@ set -euo pipefail
 PIN=b45e5ef7b9c151cfc18f0efd9f4fee9327e1a29d
 TEST_FILTER="${1:-sapio_real_two_holder_offline_recovery}"
 case "$TEST_FILTER" in
-    sapio_real_two_holder_offline_recovery|sapio_real_common_anchor_two_holder_recovery|sapio_real_stale_sender_recovery_race) ;;
+    sapio_real_two_holder_offline_recovery|sapio_real_common_anchor_two_holder_recovery|sapio_real_stale_sender_recovery_race|sapio_real_operator_expiry_sweep_alice_in_flight) ;;
     *) echo "Unknown two-holder fixture test: $TEST_FILTER" >&2; exit 1 ;;
 esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -120,7 +120,10 @@ echo "==> stage: freeze-guard (pinned SDK test build + adversarial evidence chec
 echo "==> stage: service-loss recovery ($TEST_FILTER)"
 ./contrib/sapio-e2e.sh "$TEST_FILTER"
 
-if [[ "$TEST_FILTER" == sapio_real_stale_sender_recovery_race ]]; then
+if [[ "$TEST_FILTER" == sapio_real_operator_expiry_sweep_alice_in_flight ]]; then
+    test -s "$CAPTURE_DIR/operator-expiry-race.json"
+    echo "Live watchman sweep versus Alice/Bob recovery was recorded on isolated regtest."
+elif [[ "$TEST_FILTER" == sapio_real_stale_sender_recovery_race ]]; then
     test -s "$CAPTURE_DIR/stale-branch-race.json"
     echo "Adversarial stale-owner branch race recorded on disposable regtest."
 else

@@ -13,6 +13,8 @@ use super::*;
 use bitcoin::address::NetworkUnchecked;
 use bitcoincore_rpc::{Auth, Client, RpcApi as _};
 use serde_json::json;
+use server_log::ClaimBroadcast;
+use std::time::Duration;
 use std::collections::HashSet;
 use std::fs;
 
@@ -832,26 +834,48 @@ async fn sapio_real_two_holder_offline_recovery() {
 
 #[tokio::test]
 async fn sapio_real_common_anchor_two_holder_recovery() {
-    common_anchor_fixture(false).await;
+    common_anchor_fixture(false, false).await;
 }
 
 /// Adversarial negative control: the prior program owner saves a signed exit
 /// before the two-holder transfer, then publishes it after both services die.
 #[tokio::test]
 async fn sapio_real_stale_sender_recovery_race() {
-    common_anchor_fixture(true).await;
+    common_anchor_fixture(true, false).await;
 }
 
-async fn common_anchor_fixture(stale_sender_attack: bool) {
+/// The Ark watchman authors a fresh expiry sweep after Alice begins
+/// publishing her already signed recovery path. Bob's status is measured
+/// from the actual Bitcoin chain and his independently saved bundle.
+#[tokio::test]
+async fn sapio_real_operator_expiry_sweep_alice_in_flight() {
+    common_anchor_fixture(false, true).await;
+}
+
+async fn common_anchor_fixture(stale_sender_attack: bool, operator_sweep: bool) {
     let _exclusive = TEE_LOCK.lock().await;
     let ctx = TestContext::new(if stale_sender_attack {
         "sapling_sdk/sapio_real_stale_sender_recovery_race"
+    } else if operator_sweep {
+        "sapling_sdk/sapio_real_operator_expiry_sweep_alice_in_flight"
     } else {
         "sapling_sdk/sapio_real_common_anchor_two_holder_recovery"
     }).await;
     let tee = SapioTee::launch(&ctx).await;
-    let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
-        .funded(btc(1)).create().await;
+    let server = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
+        .funded(btc(if operator_sweep { 10 } else { 1 }));
+    let server = if operator_sweep {
+        server.cfg(|cfg| cfg.vtxopool.vtxo_targets = vec![])
+            .watchmand_cfg(|cfg| {
+                cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
+                cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
+            })
+    } else { server };
+    let srv = server.create().await;
+    if operator_sweep {
+        let watchman = srv.watchmand();
+        ctx.bitcoind().fund_addr(watchman.wait_wallet_address().await, sat(1_000_000)).await;
+    }
     let sponsor_seed = bip39::Mnemonic::generate(12).unwrap();
     let fee_wallet = ctx.sdk("external-recovery-fees", &srv)
         .mnemonic(sponsor_seed.clone()).funded(sat(800_000))
@@ -939,6 +963,11 @@ async fn common_anchor_fixture(stale_sender_attack: bool) {
     assert_eq!(bob_positions[0].amount(), sat(40_000));
     let alice_point = alice_positions[0].vtxo.point();
     let bob_point = bob_positions[0].vtxo.point();
+    let vtxo_expiry = alice_positions[0].vtxo.expiry_height();
+    if operator_sweep {
+        assert_eq!(vtxo_expiry, bob_positions[0].vtxo.expiry_height(),
+            "holders must share a contractual expiry in this race");
+    }
     assert_ne!(alice_point, bob_point);
     assert_eq!(alice_positions[0].vtxo.chain_anchor(), anchor,
         "Alice lost the source's common economic root");
@@ -1036,16 +1065,233 @@ async fn common_anchor_fixture(stale_sender_attack: bool) {
     drop(bob);
     drop(sender);
     tee.stop().await.unwrap();
-    srv.stop().await.unwrap();
+    if !operator_sweep {
+        srv.stop().await.unwrap();
+    }
     assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err(),
         "Sapio local-dev signing API still answers after shutdown");
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
         "Sapio local-dev signing oracle still answers after shutdown");
-    let shutdown_height = record_shutdown(&ctx, &dir, &holders, &[
-        "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk",
-        "sapio-tee", "captaind",
-    ]);
+    let shutdown_height = record_shutdown(&ctx, &dir, &holders, if operator_sweep {
+        &["alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk", "sapio-tee"]
+    } else {
+        &["alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk", "sapio-tee", "captaind"]
+    });
+
+    if operator_sweep {
+        // The operator stays online, with its watchman signing key and funded
+        // Bitcoin fee wallet. Alice/Bob/Sapio cosigners are offline.
+        // Advance to just before expiry, leaving time to confirm only the
+        // first of Alice's genuine saved recovery ancestors.
+        let rpc = ctx.bitcoind().sync_client();
+        let alice_record = bundle_a.recoveries.iter()
+            .find(|r| r.controlled_outpoint == alice_point).unwrap();
+        let bob_record = bundle_b.recoveries.iter()
+            .find(|r| r.controlled_outpoint == bob_point).unwrap();
+        let first = alice_record.ancestors.first()
+            .expect("Alice must have a signed recovery ancestor before the claim");
+        let first_txid = first.compute_txid();
+        assert!(bob_record.ancestors.iter().any(|t| t.compute_txid() == first_txid),
+            "Bob must share Alice's first recovery ancestor");
+        let starting_height = rpc.get_block_count().unwrap() as u32;
+        let expiry = vtxo_expiry.to_u32();
+        assert!(expiry > starting_height + 12,
+            "not enough real regtest blocks remain to stage a partial recovery");
+        ctx.bitcoind().generate(expiry - starting_height - 8).await;
+        let mut alice_started = false;
+        for i in 0..5 {
+            let response = sdk_process(&ctx, "external-recovery-fees",
+                &format!("alice-before-operator-{i}"),
+                Request::Recover { outpoints: vec![], bundle: Some(alice_file.clone()) }).await;
+            let progress: Vec<ProgramRecoveryProgress> = serde_json::from_value(response).unwrap();
+            assert!(!progress.is_empty(), "Alice's native recovery process never made progress");
+            ctx.bitcoind().generate(1).await;
+            if ctx.bitcoind().transaction_confirmation(first_txid).is_ok_and(
+                |info| info.confirmations.unwrap_or(0) > 0
+            ) {
+                alice_started = true;
+                break;
+            }
+        }
+        assert!(alice_started, "Alice's real signed ancestor did not confirm before the operator");
+        let alice_first = rpc.get_raw_transaction(&first_txid, None)
+            .expect("first Alice recovery parent must exist");
+        assert_eq!(alice_first, *first, "Alice's published ancestor changed witness bytes");
+        let first_info = ctx.bitcoind().transaction_confirmation(first_txid).unwrap();
+        let first_height = rpc.get_block_header_info(&first_info.blockhash.unwrap()).unwrap().height;
+        assert!(first_height < expiry as usize,
+            "Alice's recovery must have started before VTXO expiry");
+        let alice_claim = alice_record.claim.compute_txid();
+        let bob_claim = bob_record.claim.compute_txid();
+        assert!(ctx.bitcoind().transaction_confirmation(alice_claim).is_err(),
+            "Alice's claim already confirmed: operator is not racing an in-flight exit");
+        assert!(ctx.bitcoind().transaction_confirmation(bob_claim).is_err(),
+            "Bob's claim was already confirmed before operator intervention");
+
+        // The on-chain server watchman exercises an existing sweep path, and
+        // it signs *new* transactions only after Alice's first recovery parent
+        // is confirmed. Observe its actual ClaimBroadcast messages.
+        let watchman = srv.watchmand();
+        let mut watchman_claims = watchman.subscribe_log::<ClaimBroadcast>();
+        let sweepable = vtxo_expiry + srv.config().vtxo_exit_delta;
+        let want_height = sweepable.to_u32() + 1;
+        let tip_before_sweep = rpc.get_block_count().unwrap() as u32;
+        assert!(want_height > tip_before_sweep,
+            "expiry sweep must be in the future when Alice's recovery starts");
+        let tip = ctx.generate_blocks(want_height - tip_before_sweep).await;
+        watchman.wait_for_sync_height(tip).await;
+
+        let known_honest = recovery_transactions(&holders);
+        let known_txids = known_honest.iter().map(|row| row.0).collect::<HashSet<_>>();
+        let known_ancestors = known_honest.iter().filter(|row| row.3 == "ancestor")
+            .map(|row| row.0).collect::<HashSet<_>>();
+        let known_fee_anchors = selected_recovery_anchors(&[&bundle_a, &bundle_b]);
+        let mut swept = HashSet::new();
+        let mut new_spends: Vec<(Transaction, u32)> = Vec::new();
+        for _ in 0..15 {
+            watchman.trigger_sweep().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            while let Ok(event) = watchman_claims.try_recv() {
+                swept.extend(event.vtxo_ids.iter().map(|v| v.to_point()));
+            }
+            let tip = ctx.generate_blocks(1).await;
+            watchman.wait_for_sync_height(tip).await;
+            while let Ok(event) = watchman_claims.try_recv() {
+                swept.extend(event.vtxo_ids.iter().map(|v| v.to_point()));
+            }
+            let height = rpc.get_block_count().unwrap() as u32;
+            let hash = rpc.get_block_hash(height as u64).unwrap();
+            let block = rpc.get_block(&hash).unwrap();
+            for tx in block.txdata.into_iter().skip(1) {
+                if known_txids.contains(&tx.compute_txid()) ||
+                    tx.input.iter().any(|i| known_fee_anchors.contains(&i.previous_output)) {
+                    continue;
+                }
+                let hits_recovery = tx.input.iter().any(|i|
+                    i.previous_output == anchor ||
+                    known_ancestors.contains(&i.previous_output.txid)
+                );
+                if hits_recovery {
+                    assert!(tx.input.iter().any(|i| !i.witness.is_empty()),
+                        "operator candidate has no Bitcoin signature witness");
+                    new_spends.push((tx, height));
+                }
+            }
+        }
+
+        assert!(swept.iter().any(|p| *p == anchor ||
+            known_ancestors.contains(&p.txid)),
+            "real operator watchman never claimed the shared root or its recovery chain");
+        assert!(!new_spends.is_empty(),
+            "no newly mined operator sweep transaction touched the recovery chain");
+
+        // Match the *actual* spent Bitcoin outpoints against frozen signed
+        // transitions. A matching txid alone, or a fee-only P2A child, cannot
+        // count as an operator-authored competing branch.
+        let mut conflict_rows = Vec::new();
+        let mut observed = Vec::new();
+        for (tx, height) in &new_spends {
+            let id = tx.compute_txid();
+            let wire = bitcoin::consensus::serialize(tx).iter()
+                .map(|byte| format!("{byte:02x}")).collect::<String>();
+            observed.push(json!({
+                "tx_hex": wire,
+                "txid": id.to_string(),
+                "wtxid": tx.compute_wtxid().to_string(),
+                "block_height": height,
+            }));
+            for input in &tx.input {
+                for (honest_id, honest, used_by, role) in &known_honest {
+                    if id == *honest_id { continue; }
+                    if honest.input.iter().any(|i| i.previous_output == input.previous_output) {
+                        conflict_rows.push(json!({
+                            "operator_txid": id.to_string(),
+                            "honest_txid": honest_id.to_string(),
+                            "conflicted_outpoint": input.previous_output.to_string(),
+                            "honest_used_by": used_by,
+                            "honest_role": role,
+                        }));
+                    }
+                }
+            }
+        }
+        assert!(!conflict_rows.is_empty(),
+            "watchman spent no input competing with a signed honest recovery transaction");
+
+        // A fresh-process Bob recovery attempt is observed after the operator's
+        // actual confirmed action. Conflict/failure is evidence; the harness
+        // must preserve it as an outcome rather than panic in recover_offline.
+        let mut bob_process_ok = false;
+        let mut bob_progress = serde_json::Value::Null;
+        let mut bob_confirmed = false;
+        for i in 0..8 {
+            let response_path = ctx.datadir.join(format!("bob-operator-probe-{i}.json"));
+            let mut cmd = process::command(
+                ctx.datadir.join("external-recovery-fees"), response_path.clone(),
+                Request::Recover { outpoints: vec![], bundle: Some(bob_file.clone()) },
+            );
+            let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+                .await.expect("Bob's native SDK probe timed out").expect("launch Bob's native SDK probe");
+            if !output.status.success() {
+                break;
+            }
+            bob_process_ok = true;
+            bob_progress = serde_json::from_slice(
+                &fs::read(response_path).expect("read fresh-process Bob recovery report")
+            ).expect("parse Bob recovery statuses");
+            if ctx.bitcoind().transaction_confirmation(bob_claim).is_ok_and(
+                |info| info.confirmations.unwrap_or(0) > 0
+            ) {
+                bob_confirmed = true;
+                break;
+            }
+            ctx.bitcoind().generate(1).await;
+        }
+        if ctx.bitcoind().transaction_confirmation(bob_claim).is_ok_and(
+            |info| info.confirmations.unwrap_or(0) > 0
+        ) {
+            bob_confirmed = true;
+            let chain_tx = rpc.get_raw_transaction(&bob_claim, None).unwrap();
+            assert_eq!(chain_tx, bob_record.claim,
+                "Bob's observed confirmed claim did not preserve saved signed bytes");
+        }
+        let operator_competes_with_bob = conflict_rows.iter().any(|row|
+            row["honest_used_by"].as_array().unwrap().iter().any(|s| s == "bob"));
+        if operator_competes_with_bob {
+            assert!(!bob_confirmed,
+                "Bob's contradictory frozen signed transaction confirmed after operator conflict");
+        }
+        assert_frozen_recovery_evidence(
+            &frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes,
+        );
+        let mut watchman_points = swept.iter().map(ToString::to_string).collect::<Vec<_>>();
+        watchman_points.sort();
+        save_json(&dir.join("operator-expiry-race.json"), &json!({
+            "scenario": "operator-fresh-watchman-expiry-sweep",
+            "shared_chain_anchor": anchor.to_string(),
+            "bitcoin_height_at_signer_shutdown": shutdown_height,
+            "server_kept_online_for_operator": true,
+            "sapio_tee_stopped_before_recovery": true,
+            "alice_first_ancestor_txid": first_txid.to_string(),
+            "alice_first_ancestor_wtxid": first.compute_wtxid().to_string(),
+            "alice_first_ancestor_height": first_height,
+            "expiry_height": expiry,
+            "operator_sweep_earliest_height": want_height,
+            "operator_signed_spends": observed,
+            "watchman_claimed_outpoints": watchman_points,
+            "signed_input_conflicts": conflict_rows,
+            "operator_competes_with_bob": operator_competes_with_bob,
+            "bob_native_recovery_process_ok": bob_process_ok,
+            "bob_native_recovery_progress": bob_progress,
+            "bob_claim_confirmed": bob_confirmed,
+            "alice_claim_confirmed": ctx.bitcoind()
+                .transaction_confirmation(alice_claim)
+                .is_ok_and(|info| info.confirmations.unwrap_or(0) > 0),
+        }));
+        srv.stop().await.unwrap();
+        return;
+    }
 
     if let Some((stale_point, stale_bundle)) = &stale_sender {
         // Derive conflicts from *both* parties' saved Bitcoin transactions.
