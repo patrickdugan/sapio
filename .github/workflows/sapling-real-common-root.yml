@@ -21,7 +21,7 @@ concurrency:
 jobs:
   actual-service-recovery:
     runs-on: ubuntu-24.04
-    timeout-minutes: 135
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
@@ -31,6 +31,12 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v7
+
+      - name: Adversarially validate public receipt decoders before expensive fixture builds
+        run: |
+          python3 -m unittest discover \
+            -s contrib/sapling-vtxo-entitlements/scripts \
+            -p 'test_*public_proof.py' -v
 
       - name: Recover build space before two pinned Rust service builds
         run: |
@@ -207,6 +213,40 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # Negative control: a former program holder publishes its original,
+      # fully signed claim after Alice/Bob received their shares off-chain.
+      # Success means the competing spend was genuinely mined and the later
+      # two-holder receipt was refused.
+      - name: "Scenario: stale sender signed branch races two sibling holders"
+        id: stale
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' }}
+        env:
+          SAPLING_TWO_HOLDER_CAPTURE_DIR: ${{ runner.temp }}/capture-stale-race
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$RUNNER_TEMP/regtest-stale-race.log") 2>&1
+          bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
+            sapio_real_stale_sender_recovery_race
+          echo "==> stage: complete"
+
+      - name: Independently rederive competing signed inputs and publish loss receipt
+        id: proof-stale
+        if: ${{ !cancelled() && steps.stale.outcome == 'success' }}
+        env:
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          bash contrib/sapling-vtxo-entitlements/scripts/publish_public_proof.sh \
+            stale-race "$RUNNER_TEMP/capture-stale-race" public-regtest-proof-stale-race.json
+
+      - name: Preserve only non-secret stale-branch negative-control receipt
+        if: ${{ !cancelled() && steps.proof-stale.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: saplingos-real-stale-sender-race-proof
+          path: public-regtest-proof-stale-race.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Annotate bootstrap failure
         if: ${{ always() && steps.bootstrap.outcome == 'failure' }}
         run: |
@@ -224,6 +264,12 @@ jobs:
         run: |
           python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
             "$RUNNER_TEMP/regtest-separate-roots.log" || true
+
+      - name: Annotate stale-race failure
+        if: ${{ always() && steps.stale.outcome == 'failure' }}
+        run: |
+          python3 contrib/sapling-vtxo-entitlements/scripts/summarize_ci_failure.py \
+            "$RUNNER_TEMP/regtest-stale-race.log" || true
 
       - name: Publish fixture daemon log tails as annotations
         if: failure()
