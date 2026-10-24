@@ -963,6 +963,11 @@ async fn common_anchor_fixture(stale_sender_attack: bool, operator_sweep: bool) 
     assert_eq!(bob_positions[0].amount(), sat(40_000));
     let alice_point = alice_positions[0].vtxo.point();
     let bob_point = bob_positions[0].vtxo.point();
+    let vtxo_expiry = alice_positions[0].vtxo.expiry_height();
+    if operator_sweep {
+        assert_eq!(vtxo_expiry, bob_positions[0].vtxo.expiry_height(),
+            "holders must share a contractual expiry in this race");
+    }
     assert_ne!(alice_point, bob_point);
     assert_eq!(alice_positions[0].vtxo.chain_anchor(), anchor,
         "Alice lost the source's common economic root");
@@ -1060,16 +1065,19 @@ async fn common_anchor_fixture(stale_sender_attack: bool, operator_sweep: bool) 
     drop(bob);
     drop(sender);
     tee.stop().await.unwrap();
-    srv.stop().await.unwrap();
+    if !operator_sweep {
+        srv.stop().await.unwrap();
+    }
     assert_frozen_recovery_evidence(&frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes);
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8000").await.is_err(),
         "Sapio local-dev signing API still answers after shutdown");
     assert!(tokio::net::TcpStream::connect("127.0.0.1:8367").await.is_err(),
         "Sapio local-dev signing oracle still answers after shutdown");
-    let shutdown_height = record_shutdown(&ctx, &dir, &holders, &[
-        "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk",
-        "sapio-tee", "captaind",
-    ]);
+    let shutdown_height = record_shutdown(&ctx, &dir, &holders, if operator_sweep {
+        &["alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk", "sapio-tee"]
+    } else {
+        &["alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk", "sapio-tee", "captaind"]
+    });
 
     if let Some((stale_point, stale_bundle)) = &stale_sender {
         // Derive conflicts from *both* parties' saved Bitcoin transactions.
