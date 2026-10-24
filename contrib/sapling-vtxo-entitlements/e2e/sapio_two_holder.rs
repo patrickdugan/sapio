@@ -832,8 +832,23 @@ async fn sapio_real_two_holder_offline_recovery() {
 
 #[tokio::test]
 async fn sapio_real_common_anchor_two_holder_recovery() {
+    common_anchor_fixture(false).await;
+}
+
+/// Adversarial negative control: the prior program owner saves a signed exit
+/// before the two-holder transfer, then publishes it after both services die.
+#[tokio::test]
+async fn sapio_real_stale_sender_recovery_race() {
+    common_anchor_fixture(true).await;
+}
+
+async fn common_anchor_fixture(stale_sender_attack: bool) {
     let _exclusive = TEE_LOCK.lock().await;
-    let ctx = TestContext::new("sapling_sdk/sapio_real_common_anchor_two_holder_recovery").await;
+    let ctx = TestContext::new(if stale_sender_attack {
+        "sapling_sdk/sapio_real_stale_sender_recovery_race"
+    } else {
+        "sapling_sdk/sapio_real_common_anchor_two_holder_recovery"
+    }).await;
     let tee = SapioTee::launch(&ctx).await;
     let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
         .funded(btc(1)).create().await;
@@ -845,14 +860,39 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         "recovery sponsor must have no Ark VTXOs");
     let sponsor_coins = capture_fee_wallet_funding(&fee_wallet).await;
 
-    // One genuine funded root VTXO is split by sequential native Ark
-    // transfers to two *different* Sapio program-wallet recipients.
-    // Their recovery ancestry is required to share the same chain anchor.
-    let sender = ctx.sdk("sender", &srv).boarded(sat(120_000)).create().await;
+    // In the adversarial run, the initial owner is a genuine program
+    // wallet, allowing its earlier fully signed exit to be frozen before
+    // the same economic root is transferred to Alice and Bob.
+    let stale_script = ctx.bitcoind().get_new_address().script_pubkey();
+    let sender = if stale_sender_attack {
+        let sender_seed = bip39::Mnemonic::generate(12).unwrap();
+        let sender_evidence = sender_seed.clone();
+        let sender_config = config(&tee, lifecycle_program(),
+            recovery(stale_script.clone(), 0u32.to_le_bytes().to_vec()), None);
+        ctx.sdk("sender", &srv).mnemonic(sender_seed).boarded(sat(120_000))
+            .cfg(move |c| configure_wallet(c, sender_config, &sender_evidence))
+            .create().await
+    } else {
+        ctx.sdk("sender", &srv).boarded(sat(120_000)).create().await
+    };
     let original = sender.spendable_vtxos().await.unwrap();
     assert_eq!(original.len(), 1);
     assert_eq!(original[0].amount(), sat(120_000));
     let anchor = original[0].vtxo.chain_anchor();
+    let stale_sender = if stale_sender_attack {
+        let position = original[0].vtxo.point();
+        let saved = sender.program_recovery_bundle(&[position]).await.unwrap();
+        saved.verify().unwrap();
+        assert_eq!(saved.readiness(position).unwrap(), ProgramRecoveryReadiness::Complete);
+        let claim = &saved.recoveries.iter()
+            .find(|r| r.controlled_outpoint == position).unwrap().claim;
+        assert_eq!(claim.output.len(), 2);
+        assert_eq!(claim.output[0].value, sat(120_000));
+        assert_eq!(claim.output[0].script_pubkey, stale_script);
+        Some((position, saved))
+    } else {
+        None
+    };
     drop(original);
 
     let (alice_core, alice_script) = new_recipient_wallet(&ctx, "alice-recovered");
@@ -965,14 +1005,24 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
     let bob_file = dir.join("bob-recovery.json");
     save_json(&alice_file, &bundle_a);
     save_json(&bob_file, &bundle_b);
-    let frozen_paths = [
+    let stale_file = dir.join("stale-sender-recovery.json");
+    if let Some((_, saved)) = &stale_sender {
+        save_json(&stale_file, saved);
+    }
+    let mut frozen_paths = vec![
         terms_file.as_path(), alice_file.as_path(), bob_file.as_path(),
     ];
+    if stale_sender.is_some() {
+        frozen_paths.push(stale_file.as_path());
+    }
     let frozen = frozen_recovery_evidence(&frozen_paths);
     let frozen_manifest = dir.join("frozen-evidence-before-shutdown.json");
     let frozen_manifest_bytes = freeze_manifest(&frozen_manifest, &frozen);
     let holders = [("alice", &bundle_a), ("bob", &bundle_b)];
     assert_unpublished(&ctx, &holders);
+    if let Some((_, saved)) = &stale_sender {
+        assert_unpublished(&ctx, &[("stale-sender", saved)]);
+    }
     drop(coordinator_a);
     drop(coordinator_b);
 
@@ -996,6 +1046,111 @@ async fn sapio_real_common_anchor_two_holder_recovery() {
         "alice-sdk", "bob-sdk", "external-recovery-fees-sdk", "sender-sdk",
         "sapio-tee", "captaind",
     ]);
+
+    if let Some((stale_point, stale_bundle)) = &stale_sender {
+        // Derive conflicts from *both* parties' saved Bitcoin transactions.
+        // Requiring intersecting spent outpoints eliminates imaginary races
+        // based on labels or an unrelated attacker payment.
+        let mut conflicts = Vec::new();
+        for (stale_id, stale_tx, _, _) in
+            recovery_transactions(&[("stale-sender", stale_bundle)])
+        {
+            for (honest_id, honest_tx, used_by, role) in recovery_transactions(&holders) {
+                if stale_id == honest_id { continue; }
+                for stale_input in &stale_tx.input {
+                    for honest_input in &honest_tx.input {
+                        if stale_input.previous_output == honest_input.previous_output {
+                            conflicts.push(json!({
+                                "stale_txid": stale_id.to_string(),
+                                "honest_txid": honest_id.to_string(),
+                                "conflicted_outpoint": stale_input.previous_output.to_string(),
+                                "honest_used_by": used_by,
+                                "honest_role": role,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!conflicts.is_empty(),
+            "stale owner branch never double-spent a signed Alice/Bob ancestor");
+        for name in ["alice", "bob"] {
+            assert!(conflicts.iter().any(|c| c["honest_used_by"].as_array().unwrap()
+                .iter().any(|participant| participant == name)),
+                "{name}'s recovery ancestry has no competing signed input");
+        }
+        // The real signers have stopped, and the old owner SDK has stopped.
+        // The only live signer for fees is an independently seeded Bitcoin
+        // wallet. It imports the pre-transfer fully signed sender branch,
+        // preserves its witnesses, and funds one P2A child per publication.
+        recover_offline(&ctx, "external-recovery-fees", Some(&stale_file), stale_bundle).await;
+        assert_saved_claim(&ctx, stale_bundle, *stale_point, &stale_script, sat(120_000));
+        let rpc = ctx.bitcoind().sync_client();
+        for row in &conflicts {
+            let txid: bitcoin::Txid = row["honest_txid"].as_str().unwrap().parse().unwrap();
+            assert!(rpc.get_raw_transaction(&txid, None).is_err(),
+                "conflicting honest ancestor unexpectedly confirmed: {txid}");
+        }
+        for bundle in [&bundle_a, &bundle_b] {
+            let claim = &bundle.recoveries.iter()
+                .find(|r| r.controlled_outpoint == bundle.targets[0]).unwrap().claim;
+            assert!(rpc.get_raw_transaction(&claim.compute_txid(), None).is_err(),
+                "honest holder claim unexpectedly confirmed after stale-owner win");
+        }
+        ctx.bitcoind().generate(6).await;
+        let stale_anchors = selected_recovery_anchors(&[stale_bundle]);
+        let stale_chain = confirmed_recovery_chain(
+            &ctx, &[("stale-sender", stale_bundle)],
+            shutdown_height, &sponsor_coins, &stale_anchors,
+        );
+        assert_frozen_recovery_evidence(
+            &frozen_paths, &frozen, &frozen_manifest, &frozen_manifest_bytes,
+        );
+
+        // The honest exports still pass static signature verification, but
+        // the existing chain-backed two-holder auditor must refuse to report
+        // a recovered pair after the stale branch spends their shared input.
+        let merger = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_MERGER").unwrap());
+        let auditor = PathBuf::from(std::env::var_os("SAPLING_TWO_HOLDER_AUDITOR").unwrap());
+        let merged = dir.join("both-signed-recoveries.json");
+        run_fixture_executable(&merger, &[
+            alice_file.as_os_str(), bob_file.as_os_str(),
+            terms_file.as_os_str(), merged.as_os_str()
+        ]);
+        let cli = fixture_bitcoin_cli(&ctx);
+        let audit = std::process::Command::new(&auditor)
+            .args([
+                merged.as_os_str(), terms_file.as_os_str(),
+                std::ffi::OsStr::new("--bitcoin-cli"), cli.as_os_str(),
+                std::ffi::OsStr::new("--confirmations"), std::ffi::OsStr::new("6"),
+                std::ffi::OsStr::new("--two-holder"),
+            ])
+            .env_remove("LD_LIBRARY_PATH")
+            .output().expect("run independent adversarial receipt rejection");
+        assert!(!audit.status.success(),
+            "two-holder auditor reported success after competing signed branch won");
+        fs::remove_file(cli).unwrap();
+
+        // Private report: the public validator must re-derive its identities
+        // and conflicts from the SHA-frozen original signed exports.
+        save_json(&dir.join("stale-branch-race.json"), &json!({
+            "scenario": "stale-sender-signed-branch",
+            "bitcoin_height_at_shutdown": shutdown_height,
+            "shared_chain_anchor": anchor.to_string(),
+            "stale_sender_controlled_outpoint": stale_point.to_string(),
+            "stale_sender_claim_txid": stale_bundle.recoveries.iter()
+                .find(|r| r.controlled_outpoint == *stale_point)
+                .unwrap().claim.compute_txid().to_string(),
+            "stale_sender_claim_confirmed": true,
+            "alice_claim_confirmed": false,
+            "bob_claim_confirmed": false,
+            "external_fee_sponsor_used": true,
+            "signed_input_conflicts": conflicts,
+            "stale_recovery_transactions": stale_chain,
+            "honest_two_holder_auditor_rejected": true,
+        }));
+        return;
+    }
 
     recover_offline(&ctx, "external-recovery-fees", Some(&alice_file), &bundle_a).await;
     assert_saved_claim(&ctx, &bundle_a, alice_point, &alice_script, sat(60_000));

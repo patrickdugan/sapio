@@ -339,6 +339,27 @@ and storage; the local-dev keys and Bitcoin balances remain disposable.
 These scripts provision binaries and print their paths. The native
 SaplingOS fixture itself creates its own Bitcoin, Ark and CLN test data
 and runs the actual recovery only when `run_real_two_holder.sh` is invoked.
+## Competing signed branch negative control
+
+The [stale-sender adversarial race](STALE_BRANCH_RACE.md) starts with an old,
+fully signed **120,000-sat program recovery** captured before Alice and Bob
+receive their 60,000/40,000-sat shares of one economic root. After all signers
+go offline, the previously signed sender branch is published with a separate
+P2A fee wallet. The fixture demands a real spent-input conflict against
+Alice/Bob's frozen signed ancestry and records whether their claims survive.
+
+The proof is intentionally classified as a **negative holder-safety result**
+when a confirmed stale sender exit blocks the newer agreed payouts. The
+public receipt is independently reconstructed from the frozen signed
+transactions; it cannot declare a competing branch merely from capture labels.
+This scenario models a previous owner with saved signatures. A fully malicious
+operator constructing fresh states remains a separate experiment.
+
+```sh
+bash contrib/sapling-vtxo-entitlements/scripts/run_real_two_holder.sh \
+  sapio_real_stale_sender_recovery_race
+```
+
 ## Running the genuine two-holder service-shutdown fixture
 
 An opt-in integration test at
