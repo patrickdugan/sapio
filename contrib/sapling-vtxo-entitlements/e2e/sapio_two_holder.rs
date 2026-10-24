@@ -13,6 +13,8 @@ use super::*;
 use bitcoin::address::NetworkUnchecked;
 use bitcoincore_rpc::{Auth, Client, RpcApi as _};
 use serde_json::json;
+use server_log::ClaimBroadcast;
+use std::time::Duration;
 use std::collections::HashSet;
 use std::fs;
 
@@ -832,26 +834,48 @@ async fn sapio_real_two_holder_offline_recovery() {
 
 #[tokio::test]
 async fn sapio_real_common_anchor_two_holder_recovery() {
-    common_anchor_fixture(false).await;
+    common_anchor_fixture(false, false).await;
 }
 
 /// Adversarial negative control: the prior program owner saves a signed exit
 /// before the two-holder transfer, then publishes it after both services die.
 #[tokio::test]
 async fn sapio_real_stale_sender_recovery_race() {
-    common_anchor_fixture(true).await;
+    common_anchor_fixture(true, false).await;
 }
 
-async fn common_anchor_fixture(stale_sender_attack: bool) {
+/// The Ark watchman authors a fresh expiry sweep after Alice begins
+/// publishing her already signed recovery path. Bob's status is measured
+/// from the actual Bitcoin chain and his independently saved bundle.
+#[tokio::test]
+async fn sapio_real_operator_expiry_sweep_alice_in_flight() {
+    common_anchor_fixture(false, true).await;
+}
+
+async fn common_anchor_fixture(stale_sender_attack: bool, operator_sweep: bool) {
     let _exclusive = TEE_LOCK.lock().await;
     let ctx = TestContext::new(if stale_sender_attack {
         "sapling_sdk/sapio_real_stale_sender_recovery_race"
+    } else if operator_sweep {
+        "sapling_sdk/sapio_real_operator_expiry_sweep_alice_in_flight"
     } else {
         "sapling_sdk/sapio_real_common_anchor_two_holder_recovery"
     }).await;
     let tee = SapioTee::launch(&ctx).await;
-    let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
-        .funded(btc(1)).create().await;
+    let server = ctx.captaind("server").bitcoind(ctx.bitcoind_arc())
+        .funded(btc(if operator_sweep { 10 } else { 1 }));
+    let server = if operator_sweep {
+        server.cfg(|cfg| cfg.vtxopool.vtxo_targets = vec![])
+            .watchmand_cfg(|cfg| {
+                cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
+                cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
+            })
+    } else { server };
+    let srv = server.create().await;
+    if operator_sweep {
+        let watchman = srv.watchmand();
+        ctx.bitcoind().fund_addr(watchman.wait_wallet_address().await, sat(1_000_000)).await;
+    }
     let sponsor_seed = bip39::Mnemonic::generate(12).unwrap();
     let fee_wallet = ctx.sdk("external-recovery-fees", &srv)
         .mnemonic(sponsor_seed.clone()).funded(sat(800_000))
